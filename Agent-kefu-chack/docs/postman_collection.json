@@ -1,0 +1,131 @@
+{
+  "info": {
+    "name": "客服回复幻觉检测 API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "先运行本机服务；默认用 mock 验证，真实检测会调用服务端 .env 中配置的模型。提交后自动记录 task_id。"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8000"
+    },
+    {
+      "key": "task_id",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. 健康检查",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{base_url}}/health"
+      }
+    },
+    {
+      "name": "2. 提交 mock 检测（自动保存 task_id）",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/checks",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"mode\": \"mock\",\n  \"items\": [\n    {\n      \"id\": \"h12\",\n      \"user_question\": \"可以货到付款吗？\",\n      \"system_reply\": \"目前不支持货到付款，支持微信、支付宝和银行卡在线支付。\",\n      \"knowledge_base\": \"支付方式：微信支付、支付宝、银行卡、花呗、信用卡。不支持货到付款。\"\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (pm.response.code === 202) { pm.collectionVariables.set(\"task_id\", pm.response.json().task_id); }"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. 提交真实检测（会调用模型）",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/checks",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"mode\": \"llm\",\n  \"items\": [\n    {\n      \"id\": \"h12\",\n      \"user_question\": \"可以货到付款吗？\",\n      \"system_reply\": \"目前不支持货到付款，支持微信、支付宝和银行卡在线支付。\",\n      \"knowledge_base\": \"支付方式：微信支付、支付宝、银行卡、花呗、信用卡。不支持货到付款。\"\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (pm.response.code === 202) { pm.collectionVariables.set(\"task_id\", pm.response.json().task_id); }"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. 查询任务进度与结果",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{base_url}}/api/checks/{{task_id}}"
+      }
+    },
+    {
+      "name": "5. 提交人工标签评估",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/checks/{{task_id}}/evaluate",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"labels\": [\n    {\n      \"id\": \"h12\",\n      \"is_hallucination\": false\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "6. 获取 HTML 报告",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{base_url}}/api/checks/{{task_id}}/report"
+      }
+    }
+  ]
+}
