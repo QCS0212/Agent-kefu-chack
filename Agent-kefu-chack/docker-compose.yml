@@ -1,0 +1,28 @@
+# 一键起两个服务：docker compose up --build
+# 前置：cp .env.example .env，并至少设置 MONITOR_API_TOKENS 与 MONITOR_PANEL_TOKEN
+# （容器内监听 0.0.0.0，因此读接口强制要求面板令牌，未设置会返回 503）
+services:
+  api:
+    build: .
+    command: ["python", "-B", "-m", "uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    env_file: [".env"]
+    ports: ["127.0.0.1:8000:8000"]
+    volumes:
+      - ./outputs:/app/outputs
+      - ./data:/app/data
+    restart: unless-stopped
+
+  monitor:
+    build: .
+    command: ["python", "-B", "-m", "monitor", "--host", "0.0.0.0", "--port", "8010"]
+    env_file: [".env"]
+    environment:
+      MONITOR_UPSTREAM_URL: http://api:8000
+      MONITOR_DB: /app/data/monitor.db
+      MONITOR_KNOWLEDGE_DIR: /app/knowledge
+    ports: ["127.0.0.1:8010:8010"]
+    volumes:
+      - ./data:/app/data
+      - ./knowledge:/app/knowledge
+    depends_on: [api]
+    restart: unless-stopped

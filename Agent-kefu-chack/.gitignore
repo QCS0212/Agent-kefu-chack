@@ -1,3 +1,4 @@
+# 本地环境与缓存
 .venv/
 .venv-mac/
 .idea/
@@ -6,5 +7,20 @@ __pycache__/
 .env
 .DS_Store
 __MACOSX/
+
+# 运行产物（按 AGENTS.md「密钥、日志与交付」，默认不提交）
 outputs/*
 !outputs/.gitkeep
+data/*.db
+data/*.db-wal
+data/*.db-shm
+*.sqlite3
+
+# 前端依赖与构建产物
+node_modules/
+dist/
+
+# 一键启动脚本的运行痕迹
+.run/
+out-logs/
+_smoke/

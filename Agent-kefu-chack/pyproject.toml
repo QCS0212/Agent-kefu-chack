@@ -1,9 +1,14 @@
 [project]
 name = "agent-kefu-chack"
-version = "0.2.0"
-description = "Evidence-based customer service reply checker"
+version = "0.3.0"
+description = "Evidence-based customer service reply checker with a continuous monitoring platform"
 requires-python = ">=3.12"
-dependencies = ["fastapi==0.141.1", "uvicorn==0.54.0"]
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn==0.54.0",
+    "httpx==0.28.1",
+    "pydantic==2.13.5",
+]
 
 [project.optional-dependencies]
 dev = ["httpx==0.28.1"]

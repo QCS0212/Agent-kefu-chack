@@ -1,0 +1,21 @@
+{
+  "mode": "llm",
+  "total": 20,
+  "pending_ids": [],
+  "status": "evaluated",
+  "false_positive_ids": [
+    "h16"
+  ],
+  "false_negative_ids": [],
+  "metrics": {
+    "tp": 18,
+    "fp": 1,
+    "fn": 0,
+    "tn": 1,
+    "precision": 0.9473684210526315,
+    "recall": 1.0,
+    "f1": 0.972972972972973,
+    "accuracy": 0.95
+  },
+  "note": "仅明确判为幻觉视为检出；证据不足的真实幻觉计为漏检。"
+}

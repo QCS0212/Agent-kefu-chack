@@ -1,0 +1,196 @@
+{
+  "info": {
+    "name": "客服幻觉监测平台",
+    "description": "监测平台接口集合：事件接入、事件流、统计、人工复核。先启动 `python -m monitor`（默认 127.0.0.1:8010）。默认要求接入鉴权，变量 token 需与 .env 中的 MONITOR_API_TOKENS 一致；若配置了 MONITOR_PANEL_TOKEN，读接口用 panel_token。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://127.0.0.1:8010" },
+    { "key": "token", "value": "change-me-token-1" },
+    { "key": "panel_token", "value": "" },
+    { "key": "event_id", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "健康检查",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{base_url}}/health", "host": ["{{base_url}}"], "path": ["health"] }
+      }
+    },
+    {
+      "name": "接入单条事件",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const body = pm.response.json();",
+              "if (body && body.event_id) { pm.collectionVariables.set('event_id', body.event_id); }",
+              "pm.test('202 Accepted', () => pm.response.to.have.status(202));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Monitor-Token", "value": "{{token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"session_id\": \"sess-1001\",\n  \"user_question\": \"退款多久到账？\",\n  \"system_reply\": \"已经帮您退款，1-3 个工作日到账。\",\n  \"category\": \"after_sale\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": { "raw": "{{base_url}}/api/ingest/events", "host": ["{{base_url}}"], "path": ["api", "ingest", "events"] }
+      }
+    },
+    {
+      "name": "接入批量事件",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Monitor-Token", "value": "{{token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"events\": [\n    {\n      \"session_id\": \"sess-1002\",\n      \"user_question\": \"订单什么时候到？\",\n      \"system_reply\": \"您的订单已发货，预计明天到达。\",\n      \"category\": \"after_sale\",\n      \"store_id\": \"S001\"\n    },\n    {\n      \"session_id\": \"sess-1003\",\n      \"user_question\": \"我让张经理联系您，可以吗？\",\n      \"system_reply\": \"我让张经理联系您。\",\n      \"category\": \"default\"\n    }\n  ]\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": { "raw": "{{base_url}}/api/ingest/events", "host": ["{{base_url}}"], "path": ["api", "ingest", "events"] }
+      }
+    },
+    {
+      "name": "事件详情",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "X-Monitor-Token", "value": "{{panel_token}}" }],
+        "url": {
+          "raw": "{{base_url}}/api/monitor/events/{{event_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["api", "monitor", "events", "{{event_id}}"]
+        }
+      }
+    },
+    {
+      "name": "事件流（待复核）",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "X-Monitor-Token", "value": "{{panel_token}}" }],
+        "url": {
+          "raw": "{{base_url}}/api/monitor/events?needs_review=true&review_status=pending&limit=50",
+          "host": ["{{base_url}}"],
+          "path": ["api", "monitor", "events"],
+          "query": [
+            { "key": "needs_review", "value": "true" },
+            { "key": "review_status", "value": "pending" },
+            { "key": "limit", "value": "50" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "统计（口径：幻觉率只算明确结论）",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "X-Monitor-Token", "value": "{{panel_token}}" }],
+        "url": {
+          "raw": "{{base_url}}/api/monitor/stats?days=7",
+          "host": ["{{base_url}}"],
+          "path": ["api", "monitor", "stats"],
+          "query": [{ "key": "days", "value": "7" }]
+        }
+      }
+    },
+    {
+      "name": "趋势",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "X-Monitor-Token", "value": "{{panel_token}}" }],
+        "url": {
+          "raw": "{{base_url}}/api/monitor/timeseries?days=7",
+          "host": ["{{base_url}}"],
+          "path": ["api", "monitor", "timeseries"],
+          "query": [{ "key": "days", "value": "7" }]
+        }
+      }
+    },
+    {
+      "name": "知识缺口榜",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "X-Monitor-Token", "value": "{{panel_token}}" }],
+        "url": {
+          "raw": "{{base_url}}/api/monitor/knowledge-gaps?limit=10",
+          "host": ["{{base_url}}"],
+          "path": ["api", "monitor", "knowledge-gaps"],
+          "query": [{ "key": "limit", "value": "10" }]
+        }
+      }
+    },
+    {
+      "name": "提交人工复核（确认幻觉）",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Monitor-Token", "value": "{{panel_token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"status\": \"confirmed\",\n  \"note\": \"人工核对工单系统后确认\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{base_url}}/api/monitor/events/{{event_id}}/review",
+          "host": ["{{base_url}}"],
+          "path": ["api", "monitor", "events", "{{event_id}}", "review"]
+        }
+      }
+    },
+    {
+      "name": "提交人工复核（判为误报）",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Monitor-Token", "value": "{{panel_token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"status\": \"rejected\",\n  \"note\": \"知识库过旧，实际政策已更新\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{base_url}}/api/monitor/events/{{event_id}}/review",
+          "host": ["{{base_url}}"],
+          "path": ["api", "monitor", "events", "{{event_id}}", "review"]
+        }
+      }
+    },
+    {
+      "name": "删除事件（个人信息删除）",
+      "request": {
+        "method": "DELETE",
+        "header": [{ "key": "X-Monitor-Token", "value": "{{panel_token}}" }],
+        "url": {
+          "raw": "{{base_url}}/api/monitor/events/{{event_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["api", "monitor", "events", "{{event_id}}"]
+        }
+      }
+    },
+    {
+      "name": "Prometheus 指标",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{base_url}}/metrics", "host": ["{{base_url}}"], "path": ["metrics"] }
+      }
+    }
+  ]
+}

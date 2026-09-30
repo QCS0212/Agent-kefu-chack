@@ -1,0 +1,14 @@
+.venv/
+.venv-mac/
+.idea/
+.git/
+__pycache__/
+*.pyc
+.env
+outputs/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+node_modules/
+frontend/dist/
+screenshots/
