@@ -14,8 +14,10 @@
 | 知识源 | `knowledge/` | 政策、类目、SKU、联系人名单，供监测平台装配核验依据 |
 | 前端面板 | `frontend/` | Vue 3 面板：本地结果总览、结果明细、提交与查询任务 |
 | 文档 | `docs/` | 接口说明、Postman/OpenAPI 文件、需求对话记录 |
-| 运维脚本 | `scripts/` | 一键启动/停止两个服务（PowerShell 与 shell） |
-| 容器化与 CI | `Dockerfile`、`docker-compose.yml`、`.github/workflows/` | 容器运行两个服务；CI 跑离线单元测试 |
+| 企业接入层 | `common/` | API Key、scope、租户、限流、每日配额、结构化日志与请求 ID |
+| 运维脚本 | `scripts/`、`Makefile` | 一键启动/停止、常用命令 |
+| 容器化与 CI | `Dockerfile`、`docker-compose.yml`、`.github/workflows/` | 非 root 容器 + 健康检查；CI 跑离线单元测试 |
+| 调用示例 | `examples/client.py` | 提交检测、轮询、评估、事件接入、复核的完整示例 |
 
 已包含 20 条原始回复和人工标签，每条自带 `knowledge_base`；已实现输入校验、mock、独立评估、JSON 输出、静态 HTML 报告、HTTP 接口、监测链路与单元测试。
 
@@ -39,6 +41,48 @@ docker compose up --build            # 容器方式（先 cp .env.example .env �
 ```
 
 启动后：批量检测 API `http://127.0.0.1:8000/docs`，监测平台 `http://127.0.0.1:8010/docs`，面板 `cd frontend && npm install && npm run dev`。
+
+企业形态（绑到网络地址必须配置 Key，否则服务拒绝启动）：
+
+```bash
+cp .env.example .env      # 填 API_KEYS / MONITOR_API_KEYS / MONITOR_PANEL_TOKEN / LLM_*
+docker compose up --build -d
+docker compose ps         # 两个服务都 healthy 才算成功
+API_KEY=<key> MONITOR_KEY=<key> .venv/bin/python -B examples/client.py   # 端到端自检
+```
+
+## 企业接入（Key / 租户 / 幂等）
+
+调用方只需要一把 Key，服务端不暴露模型密钥：
+
+```
+API_KEYS            = <token>|<tenant>|<scopes>|<daily_quota>|<rate_per_minute>   # 分号分隔多条
+MONITOR_API_KEYS    = 同上（scopes 为 ingest/read/admin）
+MONITOR_PANEL_TOKEN = 面板/读接口令牌（绑非本机地址时必需）
+```
+
+```bash
+# 提交检测（带幂等键，重复提交不会重复计费）
+curl -X POST http://127.0.0.1:8000/api/checks \
+  -H 'Authorization: Bearer sk-cs-9f2a' -H 'Idempotency-Key: order-0001' \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"llm","items":[{"id":"case-1","user_question":"支持退货吗？","system_reply":"支持30天无理由退货。","knowledge_base":"普通商品支持7天无理由退货。"}]}'
+
+# 查询 / 列表 / 取消 / 删除
+curl -H 'Authorization: Bearer sk-cs-9f2a' http://127.0.0.1:8000/api/checks/<task_id>
+curl -H 'Authorization: Bearer sk-cs-9f2a' 'http://127.0.0.1:8000/api/checks?status_filter=completed'
+curl -X POST -H 'Authorization: Bearer sk-cs-9f2a' http://127.0.0.1:8000/api/checks/<task_id>/cancel
+curl -X DELETE -H 'Authorization: Bearer sk-ops' http://127.0.0.1:8000/api/checks/<task_id>
+
+# 监控与就绪
+curl http://127.0.0.1:8000/healthz; curl http://127.0.0.1:8000/readyz; curl http://127.0.0.1:8000/metrics
+```
+
+- 非 admin 的 Key 只能看到自己租户的任务/事件，跨租户访问返回 404。
+- 限流与每日配额按 Key 计算，超出返回 429（带 `Retry-After`）。
+- 响应头回写 `X-Request-ID`，日志为单行 JSON，可按请求 ID 全链路排查。
+- 完整参数与错误码见 [API.md](docs/API.md)、[MONITOR.md](docs/MONITOR.md)；部署与值班见
+  [DEPLOYMENT.md](docs/DEPLOYMENT.md)、[OPERATIONS.md](docs/OPERATIONS.md)。
 CLI 核心使用标准库；HTTP API、监测平台和接口测试需按 `requirements.txt` 安装依赖。`.env.example` 为占位模板，真实检测读取根目录 `.env`，环境变量优先。
 
 ## 独立检测与评估
@@ -170,6 +214,15 @@ curl http://127.0.0.1:8010/metrics      # Prometheus 文本格式
 
 生产使用建议：把 `coverage` 与 `degraded_rate` 一起纳入告警（覆盖率下跌、降级率上升都要看），幻觉率只作为「已判定样本」上的指标；规则快检与降级结论一律走人工复核，复核结果才是对外可用的口径。
 
+## 接入商城（智选票 zhixuanpiao）
+
+检测要判得准，回复里的"能不能退、有没有退款、演出信息"必须和商城的真实数据核对。
+检测侧已内置商城知识源适配器（`monitor/shop_knowledge.py`）：配置 `MONITOR_KNOWLEDGE_SOURCE=shop`
+指向商城的只读知识接口即可，接口不可用会回退本地 `knowledge/` 并明确标注。
+支持两种取数方式：`MONITOR_KNOWLEDGE_SOURCE=shop`（调商城只读接口）或 `=mysql`（直连只读库，无需改商城代码）。
+接口契约、表映射（`d_program_*` / `d_order_*` / `d_pay_bill_*` / `d_refund_bill_*`）、
+商城侧 Java 骨架、字符集/分片注意事项与验收清单见 [docs/SHOP_INTEGRATION.md](docs/SHOP_INTEGRATION.md)。
+
 ## 前端面板
 
 ```bash
@@ -187,8 +240,9 @@ cd frontend && npm install && npm run dev
 - `knowledge/`：政策、类目、SKU、联系人名单。
 - `frontend/`：Vue 3 面板。
 - `tools/merge_api_results.py`：把多次 HTTP 任务结果合并成一次完整评估与报告。
-- `tests/`：63 项离线单元测试，覆盖指标口径、ID 对齐、证据引用、接口契约、监测链路、批量转发、失败重试与重试耗尽、复核闭环、保留期清理、接入上限与脱敏。
-- `scripts/`、`Dockerfile`、`docker-compose.yml`、`.github/workflows/tests.yml`：一键启动、容器化运行与 CI。
+- `tests/`：88 项离线单元测试，覆盖指标口径、ID 对齐、证据引用、接口契约、鉴权与租户隔离、限流配额、幂等提交、任务取消/删除、监测链路、批量转发、失败重试与重试耗尽、复核审计、告警重投、保留期清理、接入上限与脱敏。
+- `common/`：跨服务共用的鉴权、限流配额与结构化日志。
+- `examples/`、`Makefile`、`scripts/`、`Dockerfile`、`docker-compose.yml`、`.github/workflows/tests.yml`：调用示例、常用命令、一键启动、容器化与 CI。
 - `data/`：用户提供的原始附件；`outputs/`、`data/monitor.db` 为本地运行产物，不提交版本控制。
 
 ## AI 工具使用情况
@@ -204,4 +258,5 @@ cd frontend && npm install && npm run dev
 3. 完成真实报告的浏览器视觉验收和交付截图。
 4. 前端面板补充构建验证（本仓库环境未执行 `npm install`，仅做了脚本语法检查）。
 5. 接入工单/订单系统，让「已退款/已改地址」这类执行类声明可以直接核对，而不是停留在待核验。
-6. 流量继续增长时提高上游并发或改成消息队列，并补充分布式消费与多租户隔离。
+6. 流量继续增长时提高上游并发或改成消息队列，把任务队列从单机搬到 Redis/Celery 或同类组件。
+7. 多租户目前是同库逻辑隔离，若需物理隔离或强 SLA，按租户独立部署并接入统一网关计费。

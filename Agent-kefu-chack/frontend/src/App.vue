@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import { api } from './api.js'
+import { api, apiKey, setApiKey } from './api.js'
 import Dashboard from './views/Dashboard.vue'
 import Results from './views/Results.vue'
 import Submit from './views/Submit.vue'
@@ -10,6 +10,13 @@ const tab = ref('dashboard')
 const source = ref('local') // local | live
 const health = ref(null)
 const healthError = ref('')
+
+const apiKeyValue = ref(apiKey())
+
+function applyApiKey () {
+  setApiKey(apiKeyValue.value)
+  checkHealth()
+}
 
 const tabs = [
   { key: 'dashboard', label: '检测总览' },
@@ -69,6 +76,7 @@ onMounted(() => { checkHealth() })
           <span v-else class="badge" :style="{ background: 'var(--danger-soft)', color: 'var(--danger)', borderColor: '#fecaca' }" :title="healthError">
             接口不可用
           </span>
+          <input class="input" style="width: 200px" v-model="apiKeyValue" type="password" placeholder="API Key（开启鉴权时必填）" @keyup.enter="applyApiKey" @change="applyApiKey" />
           <button class="btn btn-xs" @click="checkHealth">刷新</button>
         </div>
         <span v-else class="badge" :style="{ background: 'var(--primary-soft)', color: 'var(--primary)', borderColor: '#bfdbfe' }">

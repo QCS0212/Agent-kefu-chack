@@ -22,12 +22,48 @@ EXECUTION_CLAIM = re.compile(
     r"|已退|已改|已.*?提交|已.*?升级|已.*?登记|马上.*?(?:给您|为您).{0,4}(?:退款|修改|办理))"
 )
 
-# 知识依据明确否定执行能力时，执行类声明才是确凿的能力越界
-CAPABILITY_DENIAL = re.compile(
-    r"(未接入|没有接入|不具备|无法(?:查询|修改|办理|操作|核实|执行|取消)"
-    r"|不支持.{0,8}(?:查询|修改|升级|登记|退款|改地址|取消)"
-    r"|暂无.{0,6}(?:接口|能力|权限)|无.{0,4}(?:查询|修改|操作).{0,4}(?:接口|能力|权限))"
+# 知识依据明确否定执行能力时，执行类声明才是确凿的能力越界。
+# 区分两类，避免"不支持修改配送信息"被误当成"不支持退款"：
+#   系统级否定（未接入/不具备/无相关接口）：对整个执行类声明成立
+#   操作级否定（无法 X / 不支持 X）：必须与声明中的操作（退款/修改/改地址…）出现在同一句
+BROAD_DENIAL = re.compile(
+    r"(未接入|没有接入|不具备|暂无.{0,6}(?:接口|能力|权限)"
+    r"|无.{0,4}(?:查询|修改|操作).{0,4}(?:接口|能力|权限))"
 )
+SPECIFIC_DENIAL = re.compile(
+    r"(无法(?:查询|修改|办理|操作|核实|执行|取消)"
+    r"|不支持.{0,8}(?:查询|修改|升级|登记|退款|改地址|取消))"
+)
+OPERATION_ALIASES: tuple[tuple[str, ...], ...] = (
+    ("退款", "退票", "退单", "退费"),
+    ("修改", "改地址", "改期", "变更"),
+    ("升级",),
+    ("登记", "报备"),
+    ("提交", "申请"),
+    ("取消",),
+    ("完成", "处理", "办理"),
+)
+
+
+def _claim_operations(claim_text: str) -> list[str]:
+    aliases = [alias for group in OPERATION_ALIASES for alias in group if alias in claim_text]
+    return aliases or ["退款", "退票", "退单"]
+
+
+def find_capability_denial(knowledge: str, claim_text: str) -> str | None:
+    """返回知识里明确否定该执行能力的原句；没有则返回 None。"""
+    if not knowledge:
+        return None
+    aliases = _claim_operations(claim_text)
+    for raw in re.split(r"[。；;\n]", knowledge):
+        sentence = raw.strip()
+        if not sentence:
+            continue
+        if BROAD_DENIAL.search(sentence):
+            return sentence
+        if SPECIFIC_DENIAL.search(sentence) and any(alias in sentence for alias in aliases):
+            return sentence
+    return None
 
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3}
 
@@ -50,13 +86,13 @@ class RuleEngine:
 
         execution_hit = EXECUTION_CLAIM.search(reply)
         if execution_hit:
-            denial = CAPABILITY_DENIAL.search(knowledge)
+            denial = find_capability_denial(knowledge, execution_hit.group(0))
             claims.append(
                 Claim(
                     text=execution_hit.group(0),
                     relation="unsupported",
                     reply_quote=execution_hit.group(0),
-                    knowledge_quote=denial.group(0) if denial else "",
+                    knowledge_quote=denial or "",
                     reason="回复声称已完成业务操作；"
                     + (
                         "知识依据明确说明系统不具备该能力，属于能力越界"

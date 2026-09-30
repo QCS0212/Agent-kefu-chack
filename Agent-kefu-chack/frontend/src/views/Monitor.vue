@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { monitorApi } from '../api.js'
+import { monitorApi, monitorToken, setMonitorToken } from '../api.js'
 import { verdictMeta, severityMeta, categoryMeta } from '../constants.js'
 import VChart from '../use-echarts.js'
 
@@ -12,6 +12,7 @@ const loading = ref(false)
 const error = ref('')
 const onlyReview = ref(true)
 const busyId = ref('')
+const token = ref(monitorToken())
 
 async function load () {
   loading.value = true
@@ -36,6 +37,11 @@ async function load () {
 }
 
 onMounted(load)
+
+function applyToken () {
+  setMonitorToken(token.value)
+  load()
+}
 
 function pct (value) {
   return value === null || value === undefined ? '—' : (value * 100).toFixed(2) + '%'
@@ -116,6 +122,13 @@ async function review (event, status) {
         </select>
       </div>
       <label class="check"><input type="checkbox" v-model="onlyReview" @change="load" /> 只看待复核</label>
+      <div class="field">
+        <label>面板令牌（配置 MONITOR_PANEL_TOKEN 时必填）</label>
+        <div style="display: flex; gap: 8px">
+          <input class="input" v-model="token" type="password" placeholder="X-Monitor-Token" @keyup.enter="applyToken" />
+          <button class="btn" @click="applyToken">保存</button>
+        </div>
+      </div>
       <button class="btn" @click="load" :disabled="loading">{{ loading ? '刷新中…' : '刷新' }}</button>
       <span class="hint">数据来自监测平台（127.0.0.1:8010），需要先运行 <code>python -m monitor</code></span>
     </div>

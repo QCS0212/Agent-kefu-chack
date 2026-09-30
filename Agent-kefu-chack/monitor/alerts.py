@@ -89,12 +89,43 @@ class AlertRouter:
         if not self.webhook_configured:
             return self._store(event, record, severity, fingerprint, channel)
         payload = self._payload(event, record, severity)
+        alert_id = uuid4().hex
         ok, response = self._send(payload)
-        status = STATUS_SENT if ok else STATUS_FAILED
+        if ok:
+            self.store.record_alert(
+                alert_id, event.event_id, severity, channel, fingerprint, STATUS_SENT, payload
+            )
+            return STATUS_SENT
+        # 投递失败：入库并安排退避重投，避免“一次失败就永远丢失”
         self.store.record_alert(
-            uuid4().hex, event.event_id, severity, channel, fingerprint, status, payload
+            alert_id, event.event_id, severity, channel, fingerprint, STATUS_FAILED, payload
         )
-        return status
+        self.store.schedule_alert_retry(alert_id, self._backoff(0), response)
+        return STATUS_FAILED
+
+    def retry_failed(self, limit: int = 20) -> int:
+        """重投失败的 webhook 告警：指数退避，最多 5 次；仍失败则停留在 failed 供人工重放。"""
+        if not self.webhook_configured:
+            return 0
+        retried = 0
+        for row in self.store.due_alert_retries(limit):
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except json.JSONDecodeError:
+                self.store.schedule_alert_retry(row["alert_id"], 3600, "payload 解析失败")
+                continue
+            attempt = int(row["attempts"] or 0) + 1
+            ok, response = self._send(payload)
+            if ok:
+                self.store.mark_alert(row["alert_id"], STATUS_SENT, response)
+            else:
+                self.store.schedule_alert_retry(row["alert_id"], self._backoff(attempt), response)
+            retried += 1
+        return retried
+
+    @staticmethod
+    def _backoff(attempt: int) -> float:
+        return min(300.0, 15.0 * (2 ** max(0, attempt)))
 
     def _queue(self, event, record, severity, fingerprint, channel) -> str:
         status = STATUS_QUEUED if self.webhook_configured else STATUS_STORED

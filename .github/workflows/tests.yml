@@ -18,5 +18,9 @@ jobs:
           python-version: '3.12'
       - name: 安装依赖
         run: pip install -r requirements.txt
+      - name: 语法编译检查
+        run: python -m compileall -q app monitor common tools examples
       - name: 运行离线单元测试
         run: python -m unittest discover -s tests -v
+      - name: 导出 OpenAPI（校验接口可构建）
+        run: python -B tools/export_openapi.py

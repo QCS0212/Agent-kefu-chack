@@ -1,28 +1,66 @@
 # 一键起两个服务：docker compose up --build
-# 前置：cp .env.example .env，并至少设置 MONITOR_API_TOKENS 与 MONITOR_PANEL_TOKEN
-# （容器内监听 0.0.0.0，因此读接口强制要求面板令牌，未设置会返回 503）
+# 前置：cp .env.example .env，并至少设置
+#   API_KEYS（批量检测服务，容器内绑 0.0.0.0，必须配置）
+#   MONITOR_API_KEYS（事件接入，容器内绑 0.0.0.0，必须配置）
+#   MONITOR_PANEL_TOKEN（读接口/复核/删除）
 services:
   api:
     build: .
+    image: kefu-check:latest
     command: ["python", "-B", "-m", "uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
     env_file: [".env"]
+    environment:
+      API_BIND_HOST: 0.0.0.0
+      HEALTHCHECK_PORT: "8000"
     ports: ["127.0.0.1:8000:8000"]
     volumes:
-      - ./outputs:/app/outputs
+      - api-outputs:/app/outputs
       - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
 
   monitor:
     build: .
+    image: kefu-check:latest
     command: ["python", "-B", "-m", "monitor", "--host", "0.0.0.0", "--port", "8010"]
     env_file: [".env"]
     environment:
+      MONITOR_BIND_HOST: 0.0.0.0
       MONITOR_UPSTREAM_URL: http://api:8000
+      # 需要与 API_KEYS 中具备 detect scope 的 token 一致，否则监测转发会被 401 拒绝
+      MONITOR_UPSTREAM_API_KEY: ${MONITOR_UPSTREAM_API_KEY:?请在 .env 中设置 API_KEYS 中的 detect Key}
       MONITOR_DB: /app/data/monitor.db
       MONITOR_KNOWLEDGE_DIR: /app/knowledge
+      HEALTHCHECK_PORT: "8010"
     ports: ["127.0.0.1:8010:8010"]
     volumes:
       - ./data:/app/data
       - ./knowledge:/app/knowledge
-    depends_on: [api]
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+
+volumes:
+  api-outputs:

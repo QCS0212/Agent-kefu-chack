@@ -1,7 +1,12 @@
 import json
+import os
 import threading
 import time
 import unittest
+
+os.environ.setdefault("LOG_CONFIGURE", "0")
+# 批量检测服务现在也读仓库 .env，测试显式清空接入配置以保持离线可复现
+os.environ["API_KEYS"] = ""
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from fastapi.testclient import TestClient

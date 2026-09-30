@@ -76,12 +76,19 @@ class Store:
         """为已有数据库补齐新增列，升级时不需要重建库。"""
         wanted = {
             "events": {
+                "tenant": "TEXT NOT NULL DEFAULT 'default'",
                 "next_attempt_at": "TEXT",
                 "review_status": "TEXT NOT NULL DEFAULT 'pending'",
                 "review_note": "TEXT",
                 "reviewed_at": "TEXT",
+                "reviewer": "TEXT",
             },
             "detections": {"needs_review": "INTEGER NOT NULL DEFAULT 0"},
+            "alerts": {
+                "attempts": "INTEGER NOT NULL DEFAULT 0",
+                "next_attempt_at": "TEXT",
+                "last_error": "TEXT",
+            },
         }
         with self._lock:
             for table, columns in wanted.items():
@@ -95,7 +102,7 @@ class Store:
         with self._lock:
             self.conn.close()
 
-    def ingest(self, event: IngestEvent, sampled: bool) -> tuple[str, bool]:
+    def ingest(self, event: IngestEvent, sampled: bool, tenant: str = "default") -> tuple[str, bool]:
         """写入一条事件，返回 (event_id, created)。dedup_key 命中时返回既有 id。"""
         key = dedup_key_of(event)
         with self._lock:
@@ -109,8 +116,8 @@ class Store:
             self.conn.execute(
                 "INSERT INTO events(event_id, session_id, dedup_key, category, sku, store_id,"
                 " user_question, system_reply, knowledge_snippet, occurred_at, payload,"
-                " status, sampled, attempts, error, created_at, updated_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,?,?)",
+                " status, sampled, attempts, error, created_at, updated_at, tenant)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,?,?,?)",
                 (
                     event_id,
                     event.session_id,
@@ -127,6 +134,7 @@ class Store:
                     1 if sampled else 0,
                     stamp,
                     stamp,
+                    tenant,
                 ),
             )
             self.conn.commit()
@@ -270,11 +278,13 @@ class Store:
             user_question=row["user_question"],
             system_reply=row["system_reply"],
             knowledge_snippet=row["knowledge_snippet"],
+            tenant=row["tenant"] or "default",
             attempts=row["attempts"],
             next_attempt_at=row["next_attempt_at"],
             review_status=row["review_status"] or "pending",
             review_note=row["review_note"],
             reviewed_at=row["reviewed_at"],
+            reviewer=row["reviewer"],
         )
 
     def list_events(
@@ -286,9 +296,13 @@ class Store:
         category: str | None = None,
         needs_review: bool | None = None,
         review_status: str | None = None,
+        tenant: str | None = None,
     ) -> dict:
         where = []
         params: list = []
+        if tenant:
+            where.append("e.tenant=?")
+            params.append(tenant)
         if status:
             where.append("e.status=?")
             params.append(status)
@@ -318,14 +332,17 @@ class Store:
         items = [self.get(row["event_id"]) for row in rows]
         return {"total": total, "items": items}
 
-    def stats(self, days: int | None = None) -> dict:
-        scope = ""
-        sampled_scope = "WHERE e.sampled=1"
+    def stats(self, days: int | None = None, tenant: str | None = None) -> dict:
+        conditions: list[str] = []
         params: list = []
         if days and days > 0:
-            scope = "WHERE e.created_at>=?"
-            sampled_scope = "WHERE e.created_at>=? AND e.sampled=1"
-            params = [days_ago(days)]
+            conditions.append("e.created_at>=?")
+            params.append(days_ago(days))
+        if tenant:
+            conditions.append("e.tenant=?")
+            params.append(tenant)
+        scope = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sampled_scope = "WHERE " + " AND ".join(conditions + ["e.sampled=1"])
         with self._lock:
             total = self.conn.execute(
                 f"SELECT COUNT(*) AS n FROM events e {scope}", params
@@ -424,14 +441,19 @@ class Store:
             "alerts": {row["k"]: row["n"] for row in alert_rows},
         }
 
-    def timeseries(self, days: int = 7) -> list[dict]:
+    def timeseries(self, days: int = 7, tenant: str | None = None) -> list[dict]:
         days = max(1, min(days, 90))
+        where = "WHERE e.created_at>=?"
+        params: list = [days_ago(days - 1)]
+        if tenant:
+            where += " AND e.tenant=?"
+            params.append(tenant)
         with self._lock:
             rows = self.conn.execute(
                 "SELECT date(e.created_at) AS day, d.verdict AS verdict, COUNT(*) AS n"
                 " FROM events e LEFT JOIN detections d ON d.event_id=e.event_id"
-                " WHERE e.created_at>=? GROUP BY day, d.verdict",
-                (days_ago(days - 1),),
+                f" {where} GROUP BY day, d.verdict",
+                params,
             ).fetchall()
         buckets: dict[str, dict] = {}
         for offset in range(days):
@@ -452,15 +474,17 @@ class Store:
                 bucket[row["verdict"]] = bucket.get(row["verdict"], 0) + row["n"]
         return list(buckets.values())
 
-    def knowledge_gaps(self, limit: int = 10) -> list[dict]:
+    def knowledge_gaps(self, limit: int = 10, tenant: str | None = None) -> list[dict]:
         """知识缺口：检出结论非“正常”，且装配知识时一条都没命中。"""
+        extra = " AND e.tenant=?" if tenant else ""
+        params: list = ([tenant] if tenant else []) + [limit]
         with self._lock:
             rows = self.conn.execute(
                 "SELECT e.category AS category, COUNT(*) AS hits, MAX(e.created_at) AS last_seen"
                 " FROM detections d JOIN events e ON e.event_id=d.event_id"
                 " WHERE d.knowledge_matched='[]' AND d.verdict!='no_hallucination'"
-                " GROUP BY e.category ORDER BY hits DESC LIMIT ?",
-                (limit,),
+                f"{extra} GROUP BY e.category ORDER BY hits DESC LIMIT ?",
+                params,
             ).fetchall()
             gaps = []
             for row in rows:
@@ -555,13 +579,61 @@ class Store:
             )
             self.conn.commit()
 
-    def set_review(self, event_id: str, status: str, note: str | None = None) -> bool:
-        """记录人工复核结论：confirmed（确认是幻觉）/ rejected（误报）。"""
+    def set_review(
+        self, event_id: str, status: str, note: str | None = None, reviewer: str | None = None
+    ) -> bool:
+        """记录人工复核结论与复核人：confirmed（确认是幻觉）/ rejected（误报）。"""
         with self._lock:
             cursor = self.conn.execute(
-                "UPDATE events SET review_status=?, review_note=?, reviewed_at=?, updated_at=?"
-                " WHERE event_id=?",
-                (status, note, now(), now(), event_id),
+                "UPDATE events SET review_status=?, review_note=?, reviewed_at=?, reviewer=?,"
+                " updated_at=? WHERE event_id=?",
+                (status, note, now(), reviewer, now(), event_id),
+            )
+            self.conn.commit()
+        return cursor.rowcount > 0
+
+    def list_alerts(self, status: str | None = None, limit: int = 50) -> list[dict]:
+        """告警投递记录，供运维查看与重放。"""
+        where = "WHERE status=?" if status else ""
+        params: list = ([status] if status else []) + [max(1, min(limit, 200))]
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT alert_id, event_id, severity, channel, status, attempts,"
+                f" next_attempt_at, last_error, response, created_at, sent_at FROM alerts a"
+                f" {where} ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def due_alert_retries(self, limit: int = 20) -> list[dict]:
+        """到期待重投的告警（webhook 失败且未超过尝试上限）。"""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT alert_id, event_id, severity, channel, payload, attempts FROM alerts"
+                " WHERE status='failed' AND attempts<5"
+                " AND (next_attempt_at IS NULL OR next_attempt_at<=?)"
+                " ORDER BY created_at LIMIT ?",
+                (now(), max(1, limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def schedule_alert_retry(self, alert_id: str, delay_seconds: float, error: str) -> None:
+        when = (datetime.now(timezone.utc) + timedelta(seconds=max(0.0, delay_seconds))).isoformat()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE alerts SET status='failed', attempts=attempts+1, next_attempt_at=?,"
+                " last_error=?, response=? WHERE alert_id=?",
+                (when, error[:500], error[:500], alert_id),
+            )
+            self.conn.commit()
+
+    def replay_alert(self, alert_id: str) -> bool:
+        """人工重放：把失败的告警放回待发送状态。"""
+        with self._lock:
+            cursor = self.conn.execute(
+                "UPDATE alerts SET status='queued', next_attempt_at=NULL, last_error=NULL"
+                " WHERE alert_id=? AND status IN ('failed','suppressed')",
+                (alert_id,),
             )
             self.conn.commit()
         return cursor.rowcount > 0

@@ -7,6 +7,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+os.environ.setdefault("LOG_CONFIGURE", "0")
+# 测试必须与开发者本地 .env 隔离，否则本地配置会改变断言结果
+os.environ["MONITOR_API_KEYS"] = ""
+os.environ["MONITOR_KNOWLEDGE_SOURCE"] = "file"
+os.environ["MONITOR_API_TOKENS"] = ""
+os.environ["MONITOR_PANEL_TOKEN"] = ""
+
 import httpx
 from fastapi.testclient import TestClient
 
@@ -83,6 +90,15 @@ class RuleEngineTests(unittest.TestCase):
         self.assertIsNone(record.severity)
         self.assertTrue(record.needs_review)
         self.assertEqual(record.detector, "rule")
+
+    def test_unrelated_denial_is_not_capability_overreach(self):
+        # 知识否定的是"修改配送信息"，不能据此把"已退款"判成能力越界（回归：真实库端到端时发现的误判）
+        event = make_event(system_reply="好的，我已经帮您完成了退款。")
+        record = self.engine.check(event, "【配送说明】不支持修改配送电话、地址等信息。")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.verdict, "not_verifiable")
+        self.assertTrue(record.needs_review)
+        self.assertNotEqual(record.severity, "high")
 
     def test_execution_claim_with_capability_denial_is_hallucination(self):
         # 知识依据明确说明系统不具备该能力时才判能力越界
@@ -824,6 +840,235 @@ class IngestLimitTests(unittest.TestCase):
         finally:
             app.state.store.close()
 
+
+
+
+class TenantAndAuditTests(unittest.TestCase):
+    """企业形态：多租户隔离、复核审计、告警重投与就绪检查。"""
+
+    KEY_A = "sk-tenant-a-aaa"
+    KEY_B = "sk-tenant-b-bbb"
+    KEY_ADMIN = "sk-ops-ccc"
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.settings = Settings(
+            db_path=self.tmp.name,
+            knowledge_dir=str(ROOT / "knowledge"),
+            api_keys_raw=(
+                f"{self.KEY_A}|tenant-a|ingest,read|0|0;"
+                f"{self.KEY_B}|tenant-b|ingest,read|0|0;"
+                f"{self.KEY_ADMIN}|ops|ingest,read,admin|0|0"
+            ),
+            require_auth=True,
+            require_read_auth=True,
+            rate_limit_per_minute=0,
+            max_batch_items=200,
+        )
+        self.app = create_app(self.settings, worker=False)
+        self.client = TestClient(self.app)
+        self.store = self.app.state.store
+
+    def tearDown(self):
+        self.app.state.store.close()
+        os.unlink(self.tmp.name)
+
+    def _ingest(self, key: str, session: str = "s-1"):
+        response = self.client.post(
+            "/api/ingest/events",
+            json={
+                "session_id": session,
+                "user_question": "退款多久到账？",
+                "system_reply": "1-3 个工作日原路退回。",
+            },
+            headers={"X-Monitor-Token": key},
+        )
+        self.assertEqual(response.status_code, 202)
+        return response.json()["event_id"]
+
+    def test_ingest_requires_tenant_key(self):
+        self.assertEqual(
+            self.client.post(
+                "/api/ingest/events",
+                json={"session_id": "s", "user_question": "q", "system_reply": "r"},
+            ).status_code,
+            401,
+        )
+
+    def test_events_are_isolated_per_tenant(self):
+        event_id = self._ingest(self.KEY_A)
+        own = self.client.get(
+            "/api/monitor/events", headers={"X-Monitor-Token": self.KEY_A}
+        ).json()
+        other = self.client.get(
+            "/api/monitor/events", headers={"X-Monitor-Token": self.KEY_B}
+        ).json()
+        admin = self.client.get("/api/monitor/stats", headers={"X-Monitor-Token": self.KEY_ADMIN})
+        self.assertEqual(own["total"], 1)
+        self.assertEqual(other["total"], 0)
+        self.assertEqual(admin.status_code, 200)
+        denied = self.client.get(
+            f"/api/monitor/events/{event_id}", headers={"X-Monitor-Token": self.KEY_B}
+        )
+        self.assertEqual(denied.status_code, 404)
+        detail = self.client.get(
+            f"/api/monitor/events/{event_id}", headers={"X-Monitor-Token": self.KEY_A}
+        )
+        self.assertEqual(detail.json()["tenant"], "tenant-a")
+
+    def test_review_records_audit_fields(self):
+        event_id = self._ingest(self.KEY_A)
+        self.store.save_detection(
+            DetectionRecord(
+                event_id=event_id,
+                verdict="hallucination",
+                types=["policy_error"],
+                severity="high",
+                reason="测试结论",
+                claims=[],
+                detector="llm",
+                needs_review=True,
+            )
+        )
+        response = self.client.post(
+            f"/api/monitor/events/{event_id}/review",
+            json={"status": "rejected", "note": "知识库过旧"},
+            headers={"X-Monitor-Token": self.KEY_A},
+        )
+        # tenant-a 的 Key 没有 admin 权限，写操作必须被拒绝
+        self.assertEqual(response.status_code, 403)
+        response = self.client.post(
+            f"/api/monitor/events/{event_id}/review",
+            json={"status": "rejected", "note": "知识库过旧"},
+            headers={"X-Monitor-Token": self.KEY_ADMIN},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["reviewer"], "sk-ops***")
+        doc = self.store.get(event_id)
+        self.assertEqual(doc.review_status, "rejected")
+        self.assertEqual(doc.review_note, "知识库过旧")
+        self.assertIsNotNone(doc.reviewed_at)
+
+    def test_readyz_reports_missing_ingest_key(self):
+        healthy = self.client.get("/readyz")
+        self.assertEqual(healthy.status_code, 200)
+        broken_tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        broken_tmp.close()
+        try:
+            app = create_app(Settings(db_path=broken_tmp.name, require_auth=True), worker=False)
+            client = TestClient(app)
+            try:
+                response = client.get("/readyz")
+                self.assertEqual(response.status_code, 503)
+                self.assertIn("ingest_auth", response.json()["checks"])
+            finally:
+                app.state.store.close()
+        finally:
+            os.unlink(broken_tmp.name)
+
+    def test_webhook_failure_is_retried_and_can_be_replayed(self):
+        event_id = self._ingest(self.KEY_A)
+        doc = self.store.get(event_id)
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ConnectError("webhook down")
+            return httpx.Response(200, text="ok")
+
+        settings = Settings(
+            db_path=self.tmp.name,
+            alert_webhook_url="https://hook.invalid/notify",
+            alert_min_severity="high",
+            alert_dedup_minutes=0,
+        )
+        router = AlertRouter(self.store, settings, client=httpx.Client(transport=httpx.MockTransport(handler)))
+        try:
+            record = DetectionRecord(
+                event_id=event_id,
+                verdict="hallucination",
+                types=["capability_overreach"],
+                severity="high",
+                reason="能力越界",
+                claims=[],
+                detector="rule",
+            )
+            status = router.route(doc, record)
+            self.assertEqual(status, "failed")
+            scheduled = self.store.list_alerts()[0]
+            self.assertEqual(scheduled["status"], "failed")
+            self.assertGreaterEqual(scheduled["attempts"], 1)  # 失败已安排退避重投
+            self.assertIsNotNone(scheduled["next_attempt_at"])
+            # 把退避时间提前，验证重投成功后状态流转为 sent
+            self.store.conn.execute("UPDATE alerts SET next_attempt_at=NULL")
+            self.store.conn.commit()
+            self.assertEqual(router.retry_failed(), 1)
+            alerts = self.store.list_alerts()
+            self.assertEqual(alerts[0]["status"], "sent")
+            self.assertGreaterEqual(alerts[0]["attempts"], 1)
+        finally:
+            router.close()
+
+    def test_alert_replay_endpoint(self):
+        event_id = self._ingest(self.KEY_A)
+        self.store.record_alert(
+            "alert-1", event_id, "high", "webhook", "fp-1", "failed", {"k": "v"}
+        )
+        response = self.client.post(
+            "/api/monitor/alerts/alert-1/replay", headers={"X-Monitor-Token": self.KEY_ADMIN}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.store.list_alerts()[0]["status"], "queued")
+        listing = self.client.get(
+            "/api/monitor/alerts", headers={"X-Monitor-Token": self.KEY_ADMIN}
+        )
+        self.assertEqual(listing.status_code, 200)
+
+
+
+class UpstreamCredentialTests(unittest.TestCase):
+    """监测平台转发到批量检测服务时，必须带上上游 API Key。"""
+
+    def test_authorization_header_is_sent(self):
+        seen: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(dict(request.headers))
+            if request.url.path.endswith("/api/checks"):
+                return httpx.Response(202, json={"task_id": "t-1"})
+            return httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "results": [
+                        {
+                            "id": "e-1",
+                            "verdict": "no_hallucination",
+                            "types": [],
+                            "severity": None,
+                            "reason": "依据支持",
+                            "claims": [],
+                        }
+                    ],
+                    "errors": [],
+                },
+            )
+
+        settings = Settings(
+            upstream_url="http://upstream.invalid",
+            upstream_mode="mock",
+            upstream_api_key="sk-upstream-0001",
+        )
+        client = UpstreamClient(settings, transport=httpx.MockTransport(handler))
+        try:
+            event = make_event(event_id="e-1")
+            record = client.detect(event, "知识依据")
+        finally:
+            client.close()
+        self.assertEqual(record.verdict, "no_hallucination")
+        self.assertTrue(seen and all(h.get("authorization") == "Bearer sk-upstream-0001" for h in seen))
 
 if __name__ == "__main__":
     unittest.main()

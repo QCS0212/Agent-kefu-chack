@@ -1,136 +1,134 @@
-# Postman / Apifox 调用说明
+# 批量检测 API 调用说明（企业接入版）
 
-## 启动服务
+服务：`app/api.py`，默认 `127.0.0.1:8000`。适合被客服系统、质检平台、数据管道直接调用。
+在线文档：`http://<host>:8000/docs`；静态规范：[openapi.json](openapi.json)。集合：[postman_collection.json](postman_collection.json)。
 
-在项目根目录执行：
+## 1. 启动
 
 ```bash
-# 首次安装或换机器时（已有环境可跳过）
-uv pip install --python .venv/bin/python -r requirements.txt
-# 启动，保持此终端运行
+# 本机开发（默认匿名可用）
 .venv/bin/python -B -m uvicorn app.api:app --host 127.0.0.1 --port 8000 --workers 1
+
+# 企业形态：绑到网络地址必须配置 API_KEYS，否则服务拒绝启动
+API_BIND_HOST=0.0.0.0 API_PORT=8000 \
+API_KEYS='sk-cs-9f2a|customer-service|detect,read|2000|120;sk-ops|customer-service|detect,read,admin|0|600' \
+.venv/bin/python -B -m uvicorn app.api:app --host 0.0.0.0 --port 8000 --workers 1
+
+# 容器
+docker compose up --build -d
 ```
 
-- 服务地址：`http://127.0.0.1:8000`
-- 在线接口文档：`http://127.0.0.1:8000/docs`
-- OpenAPI：`http://127.0.0.1:8000/openapi.json`
-- 真实模型配置从服务端 `.env` 读取，客户端不传模型密钥。mock 无需模型密钥。
-- 当前仅供本机开发使用，无多用户鉴权；拒绝远程客户端和其他站点的浏览器请求。不要直接作为公网服务部署。
-- 使用一个服务进程；同一任务目录有进程锁，不能使用多个 workers。修改代码后停止并重启，不建议处理任务时使用 reload。
+- 只允许 `--workers 1`：任务队列与磁盘锁都假设单进程，多 worker 会互相抢锁。
+- 真实模型配置（`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`）只放服务端 `.env`，调用方不传密钥。
 
-## Postman
+## 2. 鉴权与配额
 
-1. Import 导入 `docs/postman_collection.json`。
-2. 集合变量 `base_url` 默认是 `http://127.0.0.1:8000`。
-3. 先发送「健康检查」，再发送「提交 mock 检测」。
-4. 提交响应为 202，集合脚本会自动将 `task_id` 写入集合变量。
-5. 发送「查询任务进度与结果」，建议每 2–5 秒查询一次。
-6. `status=completed` 后可获取 HTML 报告，或提交人工标签评估。
-7. 需要真实检测时发送「提交真实检测」；这会使用服务端配置并产生上游模型调用。
+请求头二选一：
 
-如果集合脚本没有执行，手动复制响应中的 task_id 到集合变量。示例使用附件中的 h12，配套人工标签也只对应 h12；更换输入后需同步更换评估标签。
-
-## Apifox
-
-导入 `docs/openapi.json`，也可使用本机 OpenAPI URL。设置环境前置 URL 为 `http://127.0.0.1:8000`。请求体选择 JSON；在查询、评估和报告接口的路径参数中填入提交响应的 task_id。
-
-静态 OpenAPI 文件反映当前版本；修改接口后应重新导出或使用在线 OpenAPI。部分客户端导入后需要手动填写下面的请求示例。
-
-## 接口清单
-
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| GET | `/health` | 进程健康检查，不测试模型连通性 |
-| POST | `/api/checks` | 提交检测，立即返回 202 |
-| GET | `/api/checks/{task_id}` | 获取进度、逐条结果与错误 |
-| POST | `/api/checks/{task_id}/evaluate` | 提交人工标签，本地独立评估 |
-| GET | `/api/checks/{task_id}/report` | 返回可离线保存的 HTML 报告 |
-
-## 提交请求
-
-```json
-{
-  "mode": "mock",
-  "items": [
-    {
-      "id": "case-001",
-      "user_question": "支持退货吗？",
-      "system_reply": "支持七天退货。",
-      "knowledge_base": "支持七天退货。"
-    }
-  ]
-}
+```
+Authorization: Bearer <token>
+X-Api-Key: <token>
 ```
 
-`mode` 默认为 mock；改为 llm 才会调用真实模型。单条和批量使用相同接口，items 为 1–20 条。ID 在本次任务内唯一且最长100字符，三个内容字段分别最多20,000字符，字段必须为非空字符串。禁止附带 ground_truth、密钥或其他未定义字段。
+Key 配置格式（`API_KEYS`，多条用分号分隔）：
 
-响应示意：
-
-```json
-{
-  "task_id": "生成的 UUID",
-  "status": "accepted",
-  "status_url": "/api/checks/生成的 UUID",
-  "report_url": "/api/checks/生成的 UUID/report"
-}
+```
+<token>|<tenant>|<scopes>|<daily_quota>|<rate_per_minute>
 ```
 
-状态码 202 只代表已接收任务，不代表检测成功。
-
-## 任务状态与结果
-
-- `queued`：排队。
-- `running`：检测中，可查询已完成结果。
-- `completed`：全部检测及报告生成完成。
-- `partial_failed`：部分样本技术失败，其余成功结果保留。
-- `failed`：全部检测失败，或报告/存储处理失败；检查 errors 或 error。
-- `interrupted`：服务重启时发现未完成任务，保留已有结果，需要重新提交。
-
-`progress.processed` 为成功加失败数，`succeeded` 为成功数，`failed` 为技术失败数。`results` 中包含 verdict、types、severity、reason、claims。技术失败单独放入 errors，不冒充正常或证据不足。
-
-当前最多同时运行2个任务，排队加运行最多8个。重复提交会创建新任务，也可能重复收费；首版不支持幂等键、取消和自动恢复。请保留 task_id，网络断开后先查询，不要直接重复点击提交。
-
-## 独立评估
-
-检测完整完成后，发送：
-
-```json
-{
-  "labels": [
-    {"id": "case-001", "is_hallucination": false}
-  ]
-}
-```
-
-标签 ID 必须与任务完整一致，值必须为 JSON 布尔值，不能使用字符串。标签只在本地评估，不发送模型。响应包含混淆矩阵、Precision、Recall、F1、Accuracy、错例 ID。mock 不提供正式指标。
-
-没有标签时也能查看报告，但不显示检出率。评估后刷新同一报告 URL 即可看到指标。重复评估会使用最新提交的标签替换该任务的本地评估结果，不会重新调用模型。
-
-## 错误码
-
-| HTTP 状态 | 含义 |
+| 字段 | 说明 |
 |---|---|
-| 403 | 非本机调用或不允许的浏览器来源 |
-| 404 | task_id 不存在 |
-| 409 | 任务未完整完成，评估/报告暂不可用 |
-| 422 | 参数不合法、重复 ID 或标签不匹配 |
-| 429 | 当前任务队列已满 |
-| 503 | 提交真实任务时，服务端模型配置缺失或无效 |
+| scopes | `detect`（提交检测）、`read`（查询/评估/报告）、`admin`（删除任务、查看服务配置），`*` 表示全部 |
+| daily_quota | 该 Key 每日可提交的样本条数，0=不限；落盘在 `outputs/api/quota.json` |
+| rate_per_minute | 该 Key 每分钟请求上限，0=使用 `API_RATE_LIMIT` |
 
-上游模型认证失败、网络失败等发生在后台任务中，应查询任务状态和 errors，而不是只看提交请求的 202。
+未在 Key 上指定时使用 `API_RATE_LIMIT` 与 `API_DAILY_QUOTA`。`tenant` 决定数据可见范围：
+非 admin 的 Key 只能看到自己租户的任务，跨租户访问返回 404（不泄露任务是否存在）。
 
-## curl 示例
+## 3. 接口清单
+
+| 方法 | 路径 | 权限 | 用途 |
+|---|---|---|---|
+| GET | `/healthz` | 无 | 存活检查 |
+| GET | `/health` | 无 | 健康检查（兼容旧路径，含上限信息） |
+| GET | `/readyz` | 无 | 就绪检查（存储 + llm 配置），未就绪返回 503 |
+| GET | `/metrics` | 无 | Prometheus 指标 |
+| GET | `/api/service/config` | admin | 脱敏后的服务配置与调用方配额余量 |
+| POST | `/api/checks` | detect | 提交单条或批量检测，返回 202 |
+| GET | `/api/checks` | read | 任务列表（按租户过滤，支持 `status_filter`/`limit`/`offset`） |
+| GET | `/api/checks/{task_id}` | read | 任务进度、逐条结果与错误 |
+| POST | `/api/checks/{task_id}/evaluate` | read | 提交人工标签做独立评估 |
+| GET | `/api/checks/{task_id}/report` | read | 返回可离线保存的 HTML 报告 |
+| POST | `/api/checks/{task_id}/cancel` | read | 请求取消任务 |
+| DELETE | `/api/checks/{task_id}` | admin | 删除任务及其本地产物 |
+
+## 4. 提交检测
 
 ```bash
-curl http://127.0.0.1:8000/health
 curl -X POST http://127.0.0.1:8000/api/checks \
+  -H 'Authorization: Bearer sk-cs-9f2a' \
+  -H 'Idempotency-Key: order-20260930-0001' \
   -H 'Content-Type: application/json' \
-  --data-binary @docs/sample_request.json
-curl http://127.0.0.1:8000/api/checks/替换为返回的task_id
+  -d '{"mode":"mock","items":[{"id":"case-001","user_question":"支持退货吗？","system_reply":"支持七天退货。","knowledge_base":"普通商品支持七天无理由退货。"}]}'
 ```
 
-## 保存与限制
+```json
+{ "task_id": "…", "status": "accepted", "status_url": "/api/checks/…", "report_url": "/api/checks/…/report" }
+```
 
-任务位于 `outputs/api/<task_id>/`，含 task.json、raw/（真实响应）、report.html、evaluation.json（提交标签后）。当前服务重启后能查询已保存任务，未完成任务不会自动继续，避免自动产生重复调用。数据保存在本机，暂不自动清理，也不提供生产级队列和多用户隔离。
+- `mode`：`mock`（默认，验证链路）/ `llm`（调用服务端配置的真实模型）。
+- `items`：1 ~ `API_MAX_BATCH`（默认 20）条；ID 必须唯一；三个内容字段各 ≤ 20000 字符。
+- **Idempotency-Key**（可选但强烈建议）：同一 Key + 同一内容重复提交会返回首次的 `task_id`
+  并带 `idempotent_replay: true`；同一 Key 提交不同内容返回 409 `IDEMPOTENCY_CONFLICT`，避免重复计费。
+- 请求头 `X-Request-ID` 可自带，服务会回写并写进日志，便于全链路排查。
 
-开发验证使用离线测试和本机 HTTP 客户端；导入文件按标准格式生成，未声称已经在 Postman/Apifox GUI 内完成导入验证。
+## 5. 查询、取消与删除
+
+```bash
+curl -H 'Authorization: Bearer sk-cs-9f2a' http://127.0.0.1:8000/api/checks/<task_id>
+curl -H 'Authorization: Bearer sk-cs-9f2a' 'http://127.0.0.1:8000/api/checks?status_filter=completed&limit=20'
+curl -X POST -H 'Authorization: Bearer sk-cs-9f2a' http://127.0.0.1:8000/api/checks/<task_id>/cancel
+curl -X DELETE -H 'Authorization: Bearer sk-ops' http://127.0.0.1:8000/api/checks/<task_id>
+```
+
+任务状态：`queued` → `running` → `completed` / `partial_failed` / `failed` / `cancelled` / `interrupted`
+（`interrupted` = 服务重启时发现未完成任务，需重新提交）。
+
+`progress.processed = succeeded + failed`。技术失败只进 `errors`，不会伪装成正常结论；
+`partial_failed` 表示部分样本失败但其余结果可用。取消运行中的任务会保留已完成结果，不再生成完整报告。
+
+## 6. 独立评估
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/checks/<task_id>/evaluate \
+  -H 'Authorization: Bearer sk-cs-9f2a' -H 'Content-Type: application/json' \
+  -d '{"labels":[{"id":"case-001","is_hallucination":true}]}'
+```
+
+标签 ID 必须与任务样本完全一致，值为 JSON 布尔；标签只在本地计算，不会发给模型。
+返回 TP/FP/FN/TN、Precision、Recall、F1、Accuracy 与误报/漏检 ID；mock 任务不产生正式指标。
+
+## 7. 错误码
+
+| HTTP | code / 场景 | 处理建议 |
+|---|---|---|
+| 401 | `MISSING_TOKEN` / `INVALID_TOKEN` | 检查 Key 是否配置、是否放在 `Authorization: Bearer` 或 `X-Api-Key` |
+| 403 | `SCOPE_DENIED` / 浏览器来源不允许 | 换用具备该 scope 的 Key；面板联调需在 `API_CORS_ORIGINS` 内 |
+| 404 | 任务不存在或不在该租户 | 确认 task_id 与 Key 的 tenant |
+| 409 | `IDEMPOTENCY_CONFLICT` / 任务未完成 / 报告未生成 | 幂等键换新，或等任务终态再评估/取报告 |
+| 422 | 参数非法、ID 重复、超出单批上限、标签不匹配 | 按返回的 `detail` 修正请求体 |
+| 429 | `RATE_LIMITED` / `QUOTA_EXCEEDED` / 队列已满 | 按 `Retry-After` 退避；或申请更高额度 |
+| 503 | `AUTH_NOT_CONFIGURED` / 真实模型配置缺失 | 检查服务端 `.env`；`/readyz` 会给出具体原因 |
+
+## 8. 观测
+
+- `/metrics`：`api_requests_total{route,status}`、`api_auth_failures_total{code,path}`、
+  `api_items_submitted_total`、`api_tasks{status}`。
+- 日志：单行 JSON，含 `request_id`、`method`、`path`、`status`、`duration_ms`、`tenant`、`key_id`。
+- 建议：对 5xx 比例、`QUOTA_EXCEEDED`、`RATE_LIMITED` 与 `api_tasks{status="failed"}` 配置告警。
+
+## 9. 限制
+
+- 单进程、单机任务队列；任务产物存本地磁盘（`outputs/api/<task_id>/`）。
+- 重启不会自动续跑未完成任务（标记 `interrupted`），这是为了避免重复调用付费模型。
+- 不做多租户数据物理隔离（同一数据库、按 tenant 逻辑隔离），高隔离场景请按租户独立部署。

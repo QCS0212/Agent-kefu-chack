@@ -24,8 +24,10 @@
 | `README.md` | 交付说明：分类、方法、命令、实测指标、AI 使用情况 | 不定义开发约束 |
 | `docs/API.md` | 批量检测 HTTP 接口规范与 Postman/Apifox 调用说明 | 不覆盖监测平台接口 |
 | `docs/MONITOR.md` | 监测平台的接入、鉴权、抽样、批量检测、重试降级、复核闭环与指标口径 | 不覆盖批量检测 CLI |
-| `docs/postman_monitor.json` | 监测平台 Postman/Apifox 集合 | 不是接口契约本身 |
-| `scripts/`、`Dockerfile`、`docker-compose.yml` | 一键启动与容器化运行方式 | 不代表已部署到生产 |
+| `docs/postman_monitor.json`、`docs/openapi_monitor.json` | 监测平台集合与 OpenAPI | 不是接口契约本身 |
+| `docs/DEPLOYMENT.md` | 部署形态、必需环境变量、容量与升级回滚 | 不覆盖日常值班 |
+| `docs/OPERATIONS.md` | 值班巡检、复核流程、故障处理、备份与删除 | 不覆盖开发约定 |
+| `scripts/`、`Makefile`、`Dockerfile`、`docker-compose.yml` | 一键启动、常用命令与容器化 | 不代表已部署到生产 |
 | `Agent/Agent-background/Agent-kefu-background.md` | 项目背景、业务价值与阶段目标 | 不是开发授权，也不是当前进度 |
 | `docs/客服幻觉检测-完整对话.md` | 需求来源的完整对话记录 | 是历史记录，不是当前规范 |
 
@@ -36,7 +38,7 @@
 - Python 3.12+，项目根目录入口为 `main.py`；使用已有 `.venv`（Windows 为 `.venv\Scripts\python.exe`，类 Unix 为 `.venv/bin/python`）。
 - 批量检测：CLI 核心使用标准库，HTTP API 使用 FastAPI / Uvicorn，接口测试使用 httpx；报告内嵌本地 ECharts 5.6.0，许可证与 NOTICE 保存在 `app/vendor/`。
 - 监测平台：`monitor/` 使用 FastAPI / Uvicorn / httpx / pydantic，SQLite 单文件持久化，不引入额外队列或数据库中间件。
-- 已有能力：mock、输入校验、独立评估、静态 HTML 报告、异步 HTTP 接口；监测侧的事件接入、知识装配、抽样、幂等存储、规则快检、批量上游转发、失败重试与降级、告警路由、人工复核闭环、保留期清理、Prometheus 指标；以及一键启动脚本与容器化配置。
+- 已有能力：mock、输入校验、独立评估、静态 HTML 报告、异步 HTTP 接口；监测侧的事件接入、知识装配、抽样、幂等存储、规则快检、批量上游转发、失败重试与降级、告警路由（含失败重投与重放）、人工复核闭环、多租户隔离、保留期清理、Prometheus 指标；企业接入层（API Key、scope、限流、每日配额、Idempotency-Key 幂等、结构化 JSON 日志、就绪检查）；一键启动脚本与容器化配置。
 - 真实 LLM 已通过 `app/llm.py` 接入；监测平台通过 `monitor/upstream.py` 复用该服务，不重复实现模型调用。
 - `.env.example` 只保留占位配置；真实检测自动读取根目录 `.env`，环境变量优先。
 - 后续代码改变上述状态时，同步更新本文件及 README，明确哪些已经实现、哪些仍是计划。
@@ -63,7 +65,9 @@
 | `monitor/store.py` | SQLite 事件/检测/告警表与统计快照；不保存人工标签 |
 | `monitor/upstream.py` | 调用批量检测服务；上游失败一律降级为 `not_verifiable` |
 | `knowledge/` | 监测平台知识源（政策、类目、SKU、联系人名单），用于自动装配核验依据 |
+| `common/` | 跨服务共用：API Key 解析与鉴权、限流、每日配额、结构化日志与请求 ID |
 | `frontend/` | Vue 3 + Vite 面板：本地结果展示、任务提交与查询、线上监测（统计/趋势/待复核队列） |
+| `examples/` | 企业接入示例客户端（提交、轮询、评估、接入、复核） |
 | `scripts/` | 一键启动与停止脚本（Windows PowerShell 与 shell 各一份） |
 | `Dockerfile`、`docker-compose.yml` | 容器化运行两个服务；容器内绑 0.0.0.0 时必须配置面板令牌 |
 | `.github/workflows/tests.yml` | CI：安装依赖并运行全部离线单元测试 |
@@ -81,7 +85,7 @@
 
 | 服务 | 入口 | 默认地址 | 边界 |
 |---|---|---|---|
-| 批量检测 API | `uvicorn app.api:app` | `127.0.0.1:8000` | 仅本机客户端；单进程单 worker；单批 1–20 条；同时最多 2 个运行任务、最多 8 个排队任务 |
+| 批量检测 API | `uvicorn app.api:app` | `127.0.0.1:8000` | 单进程单 worker；单批 1–20 条（`API_MAX_BATCH`）；最多 2 个运行 + 8 个排队任务；绑非本机地址必须配置 `API_KEYS`，否则拒绝启动 |
 | 监测平台 | `python -m monitor` | `127.0.0.1:8010` | 默认只绑本机；接入必须鉴权；非本机绑定时读接口强制要求面板令牌（否则 503）；单次接入上限默认 200 条 |
 
 - 监测平台只通过 HTTP 调用批量检测服务（`MONITOR_UPSTREAM_URL`），不直接 import `app` 的内部实现，也不改写 `app` 的判定口径。
@@ -176,8 +180,19 @@ pwsh -File scripts/start_all.ps1     # Windows
 bash scripts/start_all.sh            # macOS / Linux
 docker compose up --build            # 容器方式（需先配置 .env）
 
-# 全部离线单元测试
+# 全部离线单元测试（88 项）
 .venv/bin/python -m unittest discover -s tests -v
+make test                            # 等价入口（macOS/Linux）
+
+# 企业形态启动（绑网络地址必须给 Key）
+API_BIND_HOST=0.0.0.0 API_KEYS='sk-cs|tenant-a|detect,read|2000|120' \
+.venv/bin/python -B -m uvicorn app.api:app --host 0.0.0.0 --port 8000 --workers 1
+
+# 重新导出 OpenAPI 规范（改动接口后必须执行）
+.venv/bin/python -B tools/export_openapi.py
+
+# 端到端自检（提交 → 轮询 → 评估 → 接入 → 复核）
+API_KEY=<key> MONITOR_KEY=<key> .venv/bin/python -B examples/client.py
 
 # 人工复核与删除（监测平台）
 curl -X POST http://127.0.0.1:8010/api/monitor/events/<event_id>/review \
@@ -239,5 +254,9 @@ curl -X DELETE http://127.0.0.1:8010/api/monitor/events/<event_id> -H 'X-Monitor
 - 两个服务都默认仅监听 127.0.0.1、单进程运行。当前不支持公网、多租户或多 worker，不把本机功能描述为生产部署能力。
 - 检测请求禁止包含人工标签；标签通过独立评估接口提交。后台技术错误单列，不伪装为语义判断。
 - 监测平台的接入接口必须鉴权：要求鉴权但未配置令牌时返回 503，而不是放行。
+- 批量检测 API 与监测平台共用一套 Key 约定：`token|tenant|scopes|daily_quota|rate_per_minute`；scope 分别是 `detect/read/admin` 与 `ingest/read/admin`。
+- 对外暴露（非回环地址）时必须有 Key；启动前校验，配置错误直接失败，不允许“先裸奔上线再补”。
+- 写操作（提交、复核、删除、重放）按租户隔离并记审计日志（key_id、tenant、request_id）；跨租户访问统一按 404 返回，不泄露资源是否存在。
+- 重复提交必须支持 `Idempotency-Key` 幂等；调用方重复计费属于交付缺陷。
 - 修改接口后同步导出 `docs/openapi.json`，更新 Postman 集合、`docs/API.md` 或 `docs/MONITOR.md`，并运行接口测试。
 - 依赖以 `pyproject.toml` 声明，以 `requirements.txt` 固定当前测试版本。

@@ -1,14 +1,13 @@
-"""监测平台 API。
+"""监测平台 API（企业接入版）。
 
-对外系统：POST /api/ingest/events 事件接入（核心交付）。
-对内运维：/api/monitor/* 只读统计、/metrics（Prometheus）、/health。
+对外：POST /api/ingest/events 事件接入（需 ingest 权限）。
+对内：/api/monitor/* 只读统计（按租户过滤）、复核、删除、告警重放；/metrics、/health、/readyz。
 
-安全默认：默认只绑 127.0.0.1；接入接口要求 Bearer/X-Monitor-Token，
-未配置令牌时拒绝接入而不是裸奔；读接口可用 MONITOR_PANEL_TOKEN 可选保护。
+安全默认：默认只绑 127.0.0.1；接入接口必须鉴权（未配置令牌返回 503）；绑到非本机地址时读接口强制要求面板令牌。
 """
 from __future__ import annotations
 
-import hmac
+import logging
 import threading
 import time
 from collections import deque
@@ -16,8 +15,11 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from common.auth import ALL_SCOPES, AuthError, Principal, QuotaTracker, RateLimiter, Authenticator
+from common.logging import REQUEST_ID_HEADER, configure_logging, set_request_id
 
 from . import __version__
 from .config import Settings, load_settings
@@ -27,39 +29,23 @@ from .sampling import SamplingPolicy
 from .store import Store
 from .worker import MonitorWorker, build_worker
 
-
-def _extract_token(authorization: str | None, x_monitor_token: str | None) -> str | None:
-    """支持 Authorization: Bearer 与 X-Monitor-Token 两种方式。"""
-    if x_monitor_token and x_monitor_token.strip():
-        return x_monitor_token.strip()
-    if authorization:
-        scheme, _, value = authorization.partition(" ")
-        if scheme.lower() == "bearer" and value.strip():
-            return value.strip()
-    return None
+logger = logging.getLogger("monitor.api")
 
 
-class RateLimiter:
-    """按调用方的滑动窗口限流，保护接入接口不被打爆。"""
+def _format_validation_error(exc: ValidationError) -> str:
+    return "; ".join(
+        "{}: {}".format(".".join(str(p) for p in err["loc"]) or "root", err["msg"])
+        for err in exc.errors()
+    )
 
-    def __init__(self, per_minute: int):
-        self.per_minute = max(0, per_minute)
-        self._hits: dict[str, deque] = {}
-        self._lock = threading.Lock()
 
-    def allow(self, key: str) -> bool:
-        if self.per_minute <= 0:
-            return True
-        now = time.monotonic()
-        with self._lock:
-            window = self._hits.setdefault(key, deque())
-            cutoff = now - 60.0
-            while window and window[0] < cutoff:
-                window.popleft()
-            if len(window) >= self.per_minute:
-                return False
-            window.append(now)
-            return True
+class ReviewRequest(BaseModel):
+    """人工复核结论：confirmed=确认是幻觉，rejected=误报。"""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    status: Literal["confirmed", "rejected"]
+    note: str | None = Field(default=None, max_length=500)
 
 
 def _normalize_events(payload: Any) -> tuple[list[Any], bool]:
@@ -79,22 +65,6 @@ def _normalize_events(payload: Any) -> tuple[list[Any], bool]:
     )
 
 
-def _format_validation_error(exc: ValidationError) -> str:
-    return "; ".join(
-        "{}: {}".format(".".join(str(p) for p in err["loc"]) or "root", err["msg"])
-        for err in exc.errors()
-    )
-
-
-class ReviewRequest(BaseModel):
-    """人工复核结论：confirmed=确认是幻觉，rejected=误报。"""
-
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    status: Literal["confirmed", "rejected"]
-    note: str | None = Field(default=None, max_length=500)
-
-
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     worker: MonitorWorker | None = app.state.worker
@@ -109,7 +79,7 @@ async def _lifespan(app: FastAPI):
             yield
         finally:
             stop_event.set()
-            thread.join(timeout=10)
+            thread.join(timeout=20)
             worker.close()
     else:
         yield
@@ -119,21 +89,41 @@ async def _lifespan(app: FastAPI):
 def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI:
     """构建监测平台应用。worker=False 用于测试，不启动后台检测线程。"""
     settings = settings or load_settings()
+    configure_logging(settings.log_level, service="monitor", json_logs=settings.log_json)
     store = Store(settings.db_path)
     sampling = SamplingPolicy(rate=settings.sample_rate, always_sample=settings.always_sample)
     rate_limiter = RateLimiter(settings.rate_limit_per_minute)
+    quota = QuotaTracker(store.path.parent / "monitor_quota.json", settings.daily_quota)
     monitor_worker = build_worker(settings, store) if worker else None
+
+    ingest_auth = Authenticator(settings.api_keys, scope="ingest", require=settings.require_auth)
+    read_keys = dict(settings.api_keys)
+    if settings.panel_token:
+        read_keys[settings.panel_token] = Principal(
+            key_id="panel***", tenant="*", scopes=ALL_SCOPES
+        )
+    # 企业形态（非本机绑定 / 配置了面板令牌 / 显式开启）强制读接口鉴权；本机默认开放便于联调
+    enforce_read = settings.require_read_auth or settings.read_auth_strict or bool(settings.panel_token)
+    read_auth = Authenticator(read_keys, scope="read", require=False, enforce=enforce_read)
+    admin_auth = Authenticator(read_keys, scope="admin", require=False, enforce=enforce_read)
 
     app = FastAPI(
         title="客服幻觉监测平台",
         version=__version__,
         lifespan=_lifespan,
-        description="接入外部系统会话事件，持续监测客服回复幻觉。",
+        description=(
+            "接入外部系统会话事件，持续监测客服回复幻觉。"
+            "支持 API Key（租户/scope/配额）、人工复核闭环、批量上游检测与告警重试。"
+        ),
     )
     app.state.settings = settings
     app.state.store = store
     app.state.sampling = sampling
     app.state.rate_limiter = rate_limiter
+    app.state.quota = quota
+    app.state.ingest_auth = ingest_auth
+    app.state.read_auth = read_auth
+    app.state.admin_auth = admin_auth
     app.state.worker = monitor_worker
     app.state.stop_event = threading.Event()
     app.state.worker_thread = None
@@ -144,56 +134,92 @@ def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI
         app.add_middleware(
             CORSMiddleware,
             allow_origins=list(settings.cors_origins),
-            allow_methods=["GET", "POST"],
-            allow_headers=["Authorization", "Content-Type", "X-Monitor-Token"],
+            allow_methods=["GET", "POST", "DELETE"],
+            allow_headers=["Authorization", "Content-Type", "X-Monitor-Token", "X-Request-ID"],
         )
 
-    def ingest_auth(
-        authorization: str | None = Header(default=None),
-        x_monitor_token: str | None = Header(default=None, alias="X-Monitor-Token"),
-    ) -> str:
-        """接入鉴权：常量时间比较；要求鉴权但未配置令牌时拒绝服务。"""
-        if settings.auth_strict:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "MONITOR_NOT_CONFIGURED：已要求鉴权但未配置 MONITOR_API_TOKENS",
-            )
-        if not settings.auth_enabled:
-            return "anonymous"
-        token = _extract_token(authorization, x_monitor_token)
-        if not token:
-            raise HTTPException(
-                status.HTTP_401_UNAUTHORIZED,
-                "MISSING_TOKEN：缺少接入令牌",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        for candidate in settings.api_tokens:
-            if hmac.compare_digest(token, candidate):
-                return f"{token[:6]}***"
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "INVALID_TOKEN：接入令牌无效")
+    @app.middleware("http")
+    async def access_log(request: Request, call_next):
+        request_id = set_request_id(request.headers.get(REQUEST_ID_HEADER))
+        started = time.monotonic()
+        response = await call_next(request)
+        response.headers[REQUEST_ID_HEADER] = request_id
+        duration_ms = round((time.monotonic() - started) * 1000, 2)
+        principal = getattr(request.state, "principal", None)
+        logger.info(
+            "request",
+            extra={
+                "extra_fields": {
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "duration_ms": duration_ms,
+                    "tenant": principal.tenant if principal else None,
+                    "key_id": principal.key_id if principal else None,
+                }
+            },
+        )
+        return response
 
-    def panel_auth(
+    # ---------------------------------------------------------------- 鉴权依赖
+
+    def _credentials(authorization: str | None, x_monitor_token: str | None):
+        return authorization, x_monitor_token
+
+    def ingest_dependency(
+        request: Request,
         authorization: str | None = Header(default=None),
         x_monitor_token: str | None = Header(default=None, alias="X-Monitor-Token"),
-    ) -> str:
-        """读接口保护：未配面板令牌时仅允许本机绑定，非本机绑定必须配置令牌。"""
+    ) -> Principal:
+        try:
+            principal = ingest_auth.authenticate(authorization, x_monitor_token)
+            rate_limiter.check(principal)
+        except AuthError as exc:
+            raise HTTPException(exc.status, f"{exc.code}：{exc.message}", headers=exc.headers) from None
+        request.state.principal = principal
+        return principal
+
+    def read_dependency(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        x_monitor_token: str | None = Header(default=None, alias="X-Monitor-Token"),
+    ) -> Principal:
         if settings.read_auth_strict:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "MONITOR_NOT_CONFIGURED：监听地址不是本机时必须配置 MONITOR_PANEL_TOKEN",
             )
-        if not settings.panel_token:
-            return "anonymous"
-        token = _extract_token(authorization, x_monitor_token)
-        if not token:
+        try:
+            principal = read_auth.authenticate(authorization, x_monitor_token)
+        except AuthError as exc:
+            raise HTTPException(exc.status, f"{exc.code}：{exc.message}", headers=exc.headers) from None
+        request.state.principal = principal
+        return principal
+
+    def admin_dependency(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        x_monitor_token: str | None = Header(default=None, alias="X-Monitor-Token"),
+    ) -> Principal:
+        if settings.read_auth_strict:
             raise HTTPException(
-                status.HTTP_401_UNAUTHORIZED,
-                "MISSING_TOKEN：缺少面板令牌",
-                headers={"WWW-Authenticate": "Bearer"},
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "MONITOR_NOT_CONFIGURED：监听地址不是本机时必须配置 MONITOR_PANEL_TOKEN",
             )
-        if hmac.compare_digest(token, settings.panel_token):
-            return "panel***"
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "INVALID_TOKEN：面板令牌无效")
+        try:
+            principal = admin_auth.authenticate(authorization, x_monitor_token)
+        except AuthError as exc:
+            raise HTTPException(exc.status, f"{exc.code}：{exc.message}", headers=exc.headers) from None
+        request.state.principal = principal
+        return principal
+
+    def tenant_scope(principal: Principal) -> str | None:
+        """管理员可看全部租户；其他身份只看自己的租户。"""
+        if principal.has("admin") or principal.tenant == "*":
+            return None
+        return principal.tenant
+
+    # ---------------------------------------------------------------- 元信息
 
     @app.get("/", tags=["meta"])
     async def root():
@@ -204,9 +230,55 @@ def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI
             "read": "GET /api/monitor/*",
             "review": "POST /api/monitor/events/{event_id}/review",
             "delete": "DELETE /api/monitor/events/{event_id}",
+            "alerts": "GET /api/monitor/alerts",
             "metrics": "GET /metrics",
             "health": "GET /health",
+            "ready": "GET /readyz",
         }
+
+    @app.get("/healthz", tags=["ops"], summary="存活检查")
+    async def healthz():
+        """轻量存活探针：只证明进程可用，不探测上游。"""
+        return {"status": "ok", "version": __version__}
+
+    @app.get("/health", tags=["ops"], summary="健康检查")
+    async def get_health():
+        worker = app.state.worker
+        stats = store.stats()
+        upstream = worker.upstream.probe() if worker is not None else {"status": "disabled"}
+        return {
+            "status": "ok",
+            "version": __version__,
+            "worker": "running" if worker is not None else "disabled",
+            "queue_pending": stats["events"]["by_status"].get("pending", 0),
+            "upstream": upstream,
+        }
+
+    @app.get("/readyz", tags=["ops"], summary="就绪检查")
+    async def readyz():
+        worker = app.state.worker
+        checks: dict[str, Any] = {"store": "ok", "upstream": "unknown", "ingest_auth": "ok"}
+        ready = True
+        try:
+            store.stats()
+        except Exception as exc:  # pragma: no cover - 存储异常
+            checks["store"] = f"error: {exc}"
+            ready = False
+        if ingest_auth.strict:
+            checks["ingest_auth"] = "MONITOR_API_TOKENS 未配置，接入接口将返回 503"
+            ready = False
+        if worker is not None:
+            probe = worker.upstream.probe()
+            checks["upstream"] = probe.get("status", "unknown")
+            if probe.get("status") == "unreachable":
+                ready = False
+        status_code = 200 if ready else 503
+        return JSONResponse(
+            status_code=status_code,
+            content={"status": "ready" if ready else "degraded", "checks": checks},
+        )
+
+    # ---------------------------------------------------------------- 接入
 
     @app.post(
         "/api/ingest/events",
@@ -217,15 +289,9 @@ def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI
     async def ingest_events(
         request: Request,
         payload: Any = Body(...),
-        caller: str = Depends(ingest_auth),
+        principal: Principal = Depends(ingest_dependency),
     ):
         """接入一条或多条客服会话事件，异步检测；同一事件重复接入幂等返回。"""
-        if not rate_limiter.allow(caller):
-            raise HTTPException(
-                status.HTTP_429_TOO_MANY_REQUESTS,
-                "RATE_LIMITED：接入频率超出限制",
-                headers={"Retry-After": "60"},
-            )
         items, is_batch = _normalize_events(payload)
         limit = settings.max_batch_items
         if limit and len(items) > limit:
@@ -233,6 +299,10 @@ def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI
                 413,
                 f"单次最多接入 {limit} 条事件，当前 {len(items)} 条；请分批提交",
             )
+        try:
+            quota.reserve(principal, len(items))
+        except AuthError as exc:
+            raise HTTPException(exc.status, f"{exc.code}：{exc.message}", headers=exc.headers) from None
         accepted: list[IngestAck] = []
         rejected: list[dict] = []
         for index, item in enumerate(items):
@@ -251,7 +321,7 @@ def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI
                 rejected.append({"index": index, "error": detail})
                 continue
             sampled = sampling.should_sample(event)
-            event_id, created = store.ingest(event, sampled)
+            event_id, created = store.ingest(event, sampled, tenant=principal.tenant)
             if created:
                 event_status = "sampled" if sampled else "skipped"
             else:
@@ -270,17 +340,25 @@ def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI
             return accepted[0] if accepted else None
         return {"accepted": accepted, "rejected": rejected}
 
+    # ---------------------------------------------------------------- 只读
+
     @app.get("/api/monitor/stats", tags=["read"], summary="整体统计")
-    async def get_stats(days: int | None = None, _caller: str = Depends(panel_auth)):
-        return store.stats(max(1, min(days, 365)) if days else None)
+    async def get_stats(
+        days: int | None = None, principal: Principal = Depends(read_dependency)
+    ):
+        return store.stats(
+            max(1, min(days, 365)) if days else None, tenant=tenant_scope(principal)
+        )
 
     @app.get("/api/monitor/timeseries", tags=["read"], summary="趋势时间序列")
-    async def get_timeseries(days: int = 7, _caller: str = Depends(panel_auth)):
-        return store.timeseries(days)
+    async def get_timeseries(days: int = 7, principal: Principal = Depends(read_dependency)):
+        return store.timeseries(days, tenant=tenant_scope(principal))
 
     @app.get("/api/monitor/knowledge-gaps", tags=["read"], summary="知识缺口榜")
-    async def get_knowledge_gaps(limit: int = 10, _caller: str = Depends(panel_auth)):
-        return store.knowledge_gaps(max(1, min(limit, 200)))
+    async def get_knowledge_gaps(
+        limit: int = 10, principal: Principal = Depends(read_dependency)
+    ):
+        return store.knowledge_gaps(max(1, min(limit, 200)), tenant=tenant_scope(principal))
 
     @app.get("/api/monitor/events", tags=["read"], summary="事件流")
     async def list_events(
@@ -291,7 +369,7 @@ def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI
         category: str | None = None,
         needs_review: bool | None = None,
         review_status: str | None = None,
-        _caller: str = Depends(panel_auth),
+        principal: Principal = Depends(read_dependency),
     ):
         limit = max(1, min(limit, 200))
         offset = max(0, offset)
@@ -303,6 +381,7 @@ def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI
             category=category,
             needs_review=needs_review,
             review_status=review_status,
+            tenant=tenant_scope(principal),
         )
         return {
             "total": result["total"],
@@ -318,35 +397,62 @@ def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI
         response_model=EventDocument,
         summary="事件详情与检测结果",
     )
-    async def get_event(event_id: str, _caller: str = Depends(panel_auth)):
+    async def get_event(event_id: str, principal: Principal = Depends(read_dependency)):
         doc = store.get(event_id)
-        if doc is None:
+        scope = tenant_scope(principal)
+        if doc is None or (scope and doc.tenant != scope):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "EVENT_NOT_FOUND：事件不存在")
         return doc
 
     @app.get("/api/monitor/config", tags=["read"], summary="脱敏后的运行配置")
-    async def get_config(_caller: str = Depends(panel_auth)):
-        return settings.masked()
+    async def get_config(principal: Principal = Depends(read_dependency)):
+        payload = settings.masked()
+        payload["quota"] = quota.snapshot(principal)
+        return payload
 
-    @app.post(
-        "/api/monitor/events/{event_id}/review",
-        tags=["review"],
-        summary="提交人工复核结论",
-    )
+    @app.get("/api/monitor/alerts", tags=["read"], summary="告警投递记录")
+    async def list_alerts(
+        status_filter: str | None = None,
+        limit: int = 50,
+        principal: Principal = Depends(read_dependency),
+    ):
+        return {
+            "limit": max(1, min(limit, 200)),
+            "items": store.list_alerts(status_filter, limit),
+        }
+
+    # ---------------------------------------------------------------- 复核与删除
+
+    @app.post("/api/monitor/events/{event_id}/review", tags=["review"], summary="提交人工复核结论")
     async def review_event(
         event_id: str,
         body: ReviewRequest,
-        _caller: str = Depends(panel_auth),
+        principal: Principal = Depends(admin_dependency),
     ):
-        """确认是幻觉（confirmed）或标记误报（rejected），用于统计复核后精确率。"""
-        if not store.set_review(event_id, body.status, body.note):
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "EVENT_NOT_FOUND：事件不存在")
+        """确认是幻觉（confirmed）或标记误报（rejected），记录复核人用于审计。"""
         doc = store.get(event_id)
+        scope = tenant_scope(principal)
+        if doc is None or (scope and doc.tenant != scope):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "EVENT_NOT_FOUND：事件不存在")
+        store.set_review(event_id, body.status, body.note, reviewer=principal.key_id)
+        updated = store.get(event_id)
+        logger.info(
+            "人工复核",
+            extra={
+                "extra_fields": {
+                    "event_id": event_id,
+                    "status": body.status,
+                    "reviewer": principal.key_id,
+                    "tenant": principal.tenant,
+                }
+            },
+        )
         return {
             "event_id": event_id,
-            "review_status": doc.review_status if doc else body.status,
-            "review_note": doc.review_note if doc else body.note,
-            "reviewed_at": doc.reviewed_at if doc else None,
+            "review_status": updated.review_status if updated else body.status,
+            "review_note": updated.review_note if updated else body.note,
+            "reviewer": updated.reviewer if updated else principal.key_id,
+            "reviewed_at": updated.reviewed_at if updated else None,
         }
 
     @app.delete(
@@ -354,10 +460,25 @@ def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI
         tags=["review"],
         summary="删除事件（个人信息删除请求）",
     )
-    async def delete_event(event_id: str, _caller: str = Depends(panel_auth)):
-        if not store.delete_event(event_id):
+    async def delete_event(event_id: str, principal: Principal = Depends(admin_dependency)):
+        doc = store.get(event_id)
+        scope = tenant_scope(principal)
+        if doc is None or (scope and doc.tenant != scope):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "EVENT_NOT_FOUND：事件不存在")
+        store.delete_event(event_id)
+        logger.warning(
+            "事件已删除",
+            extra={"extra_fields": {"event_id": event_id, "key_id": principal.key_id}},
+        )
         return {"event_id": event_id, "deleted": True}
+
+    @app.post("/api/monitor/alerts/{alert_id}/replay", tags=["review"], summary="重放失败告警")
+    async def replay_alert(alert_id: str, principal: Principal = Depends(admin_dependency)):
+        if not store.replay_alert(alert_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "ALERT_NOT_FOUND：告警不存在或无需重放")
+        return {"alert_id": alert_id, "status": "queued"}
+
+    # ---------------------------------------------------------------- 指标
 
     @app.get("/metrics", tags=["ops"], summary="Prometheus 指标")
     async def get_metrics():
@@ -367,18 +488,5 @@ def create_app(settings: Settings | None = None, worker: bool = True) -> FastAPI
             metrics.render(store),
             media_type="text/plain; version=0.0.4; charset=utf-8",
         )
-
-    @app.get("/health", tags=["ops"], summary="健康检查")
-    async def get_health():
-        worker = app.state.worker
-        stats = store.stats()
-        upstream = worker.upstream.probe() if worker is not None else {"status": "disabled"}
-        return {
-            "status": "ok",
-            "version": __version__,
-            "worker": "running" if worker is not None else "disabled",
-            "queue_pending": stats["events"]["by_status"].get("pending", 0),
-            "upstream": upstream,
-        }
 
     return app

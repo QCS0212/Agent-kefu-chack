@@ -89,11 +89,13 @@ class EventDocument(BaseModel):
     user_question: str
     system_reply: str
     knowledge_snippet: str | None = None
+    tenant: str = "default"
     attempts: int = 0
     next_attempt_at: str | None = None
     review_status: ReviewStatus = "pending"
     review_note: str | None = None
     reviewed_at: str | None = None
+    reviewer: str | None = None
 
 
 class IngestAck(BaseModel):

@@ -15,8 +15,10 @@ from .config import Settings
 from .knowledge import FileKnowledgeSource
 from .metrics import Metrics
 from .models import DetectionError, DetectionRecord, EventDocument, IngestEvent
+from .mysql_knowledge import MysqlKnowledgeSource, ShopDbConfig
 from .rules import RuleEngine, attach_event_id
 from .sampling import SamplingPolicy
+from .shop_knowledge import ShopKnowledgeSource
 from .store import Store
 from .upstream import UpstreamClient, fallback_record
 
@@ -111,6 +113,10 @@ class MonitorWorker:
             self.alerts.flush_digest()
         except Exception:
             logger.exception("日报发送失败")
+        try:
+            self.alerts.retry_failed()
+        except Exception:
+            logger.exception("告警重投失败")
         try:
             self._maintain()
         except Exception:
@@ -264,14 +270,46 @@ class MonitorWorker:
         self.alerts.close()
 
 
+def build_knowledge_source(settings: Settings):
+    """按配置选择知识源：商城只读接口 / 只读库优先，失败按配置回退本地 knowledge/ 目录。"""
+    file_source = FileKnowledgeSource(Path(settings.knowledge_dir))
+    if settings.knowledge_source == "mysql":
+        return MysqlKnowledgeSource(
+            config=ShopDbConfig(
+                host=settings.shop_db_host,
+                port=settings.shop_db_port,
+                user=settings.shop_db_user,
+                password=settings.shop_db_password,
+                program_db=settings.shop_db_program,
+                order_db=settings.shop_db_order,
+                pay_db=settings.shop_db_pay,
+                db_suffixes=settings.shop_db_suffixes,
+                timeout=settings.shop_timeout,
+            ),
+            fallback=file_source if settings.shop_fallback_file else None,
+        )
+    if settings.knowledge_source == "shop" and settings.shop_knowledge_url:
+        return ShopKnowledgeSource(
+            url=settings.shop_knowledge_url,
+            token=settings.shop_token,
+            timeout=settings.shop_timeout,
+            fallback=file_source if settings.shop_fallback_file else None,
+        )
+    return file_source
+
+
 def build_worker(settings: Settings, store: Store) -> MonitorWorker:
-    knowledge_source = FileKnowledgeSource(Path(settings.knowledge_dir))
+    knowledge_source = build_knowledge_source(settings)
+    # 联系人名单始终来自本地 knowledge/contacts.json：商城/库知识源不提供该名单
+    names = getattr(knowledge_source, "names", None)
+    if names is None:
+        names = FileKnowledgeSource(Path(settings.knowledge_dir)).names
     return MonitorWorker(
         settings=settings,
         store=store,
         upstream=UpstreamClient(settings),
         knowledge_source=knowledge_source,
-        rules=RuleEngine(knowledge_source.names),
+        rules=RuleEngine(names),
         sampling=SamplingPolicy(
             rate=settings.sample_rate, always_sample=settings.always_sample
         ),

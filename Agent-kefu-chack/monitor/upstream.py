@@ -127,7 +127,14 @@ class UpstreamClient:
         self.base_url = settings.upstream_url
         self.mode = settings.upstream_mode
         self.detector_name = "llm" if self.mode == "llm" else "mock"
-        self.client = httpx.Client(base_url=self.base_url, timeout=30.0, transport=transport)
+        headers = (
+            {"Authorization": f"Bearer {settings.upstream_api_key}"}
+            if getattr(settings, "upstream_api_key", "")
+            else None
+        )
+        self.client = httpx.Client(
+            base_url=self.base_url, timeout=30.0, transport=transport, headers=headers
+        )
 
     def close(self) -> None:
         self.client.close()

@@ -30,10 +30,20 @@ cp .env.example .env && docker compose up --build
 
 | 接口组 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /api/ingest/events` | 必须 | `Authorization: Bearer <token>` 或 `X-Monitor-Token`，常量时间比较 |
-| `/api/monitor/*`（读） | 本机可匿名；非本机绑定必须配置 `MONITOR_PANEL_TOKEN` | 未配置且非本机绑定时返回 503，避免明文会话数据公开 |
-| `POST .../review`、`DELETE /api/monitor/events/{id}` | 同上（写操作） | 复核与删除会修改数据，外部暴露前务必配置面板令牌 |
-| `/metrics`、`/health` | 无 | 仅运维探测，默认只绑本机 |
+| `POST /api/ingest/events` | 必须（scope=ingest） | `Authorization: Bearer <token>` 或 `X-Monitor-Token`，常量时间比较 |
+| `GET /api/monitor/*`（读） | scope=read | 配了 `MONITOR_PANEL_TOKEN` 或绑非本机地址时强制鉴权；本机默认开放便于联调 |
+| `POST .../review`、`DELETE /api/monitor/events/{id}`、`POST /api/monitor/alerts/{id}/replay` | scope=admin | 复核/删除/重放都会改数据，外部暴露前务必配置面板令牌或 admin Key |
+| `/metrics`、`/health`、`/readyz` | 无 | 仅运维探测，默认只绑本机 |
+
+Key 配置（`MONITOR_API_KEYS`，多条用分号分隔）：
+
+```
+<token>|<tenant>|<scopes>|<daily_quota>|<rate_per_minute>
+```
+
+- `tenant` 决定事件归属与可见范围：非 admin 的 Key 只能看到自己租户的事件与统计，跨租户访问返回 404。
+- 兼容旧配置：只设置 `MONITOR_API_TOKENS`（纯令牌、逗号分隔）时按 `tenant=default`、全部 scope 处理。
+- `MONITOR_REQUIRE_READ_AUTH=1` 可强制本机也校验读接口；非本机绑定自动强制。
 
 - `MONITOR_REQUIRE_AUTH=1` 且未配置任何令牌时，接入接口返回 **503 `MONITOR_NOT_CONFIGURED`**，而不是放行。
 - 令牌错误或缺失返回 401。`MONITOR_REQUIRE_AUTH=0` 仅用于本机调试。
@@ -53,9 +63,12 @@ cp .env.example .env && docker compose up --build
 | GET | `/api/monitor/stats` | 总体统计（口径见下） |
 | GET | `/api/monitor/timeseries` | 按天趋势，默认 7 天，最多 90 天 |
 | GET | `/api/monitor/knowledge-gaps` | 知识缺口榜（未命中知识且非「正常」的类目） |
-| GET | `/api/monitor/config` | 脱敏后的运行配置 |
+| GET | `/api/monitor/config` | 脱敏后的运行配置与调用方配额余量 |
+| GET | `/api/monitor/alerts` | 告警投递记录（含 attempts / next_attempt_at / last_error） |
+| POST | `/api/monitor/alerts/{alert_id}/replay` | 重放失败的告警（admin） |
 | GET | `/metrics` | Prometheus 文本格式指标 |
 | GET | `/health` | 健康检查，含待处理队列与上游探活 |
+| GET | `/readyz` | 就绪检查：存储 + 接入鉴权配置 + 上游探活，未就绪返回 503 |
 
 Postman/Apifox 可直接导入 `postman_monitor.json`（含接入、事件流、统计、复核、删除、指标共 12 个请求，集合变量里填令牌）。
 
@@ -77,6 +90,13 @@ Postman/Apifox 可直接导入 `postman_monitor.json`（含接入、事件流、
 
 - 必填：`session_id`、`user_question`、`system_reply`（后两者上限 20,000 字符）；未知字段直接拒绝。
 - 批量接入时单条非法只计入 `rejected`，不影响其他条目；`duplicate=true` 表示命中去重键并返回既有事件。
+- 事件归属的 `tenant` 由调用方 Key 决定，请求体不能指定（`extra="forbid"`），事件详情里会回显。
+
+## 多租户与审计
+
+- 事件、统计、趋势、知识缺口、事件流都按 Key 的 `tenant` 过滤；admin scope 或不带租户限制的面板令牌可见全部。
+- 复核会记录 `reviewer`（Key 标识）、`review_note`、`reviewed_at`，审计字段随事件详情返回。
+- 接入、复核、删除都会写结构化日志（含 `request_id`、`tenant`、`key_id`），便于事后追溯。
 
 ## 处理流程与判定边界
 
@@ -114,6 +134,15 @@ Prometheus 暴露：`monitor_events_total`、`monitor_sampled_total`、`monitor_
 
 **告警建议**：对 `monitor_coverage` 下降、`monitor_degraded_rate` 上升、`monitor_unresolved_total` 增长配置告警；不要只看幻觉率。
 
+## 知识源：本地目录 / 商城只读接口
+
+- `MONITOR_KNOWLEDGE_SOURCE=file`（默认）：只用本地 `knowledge/` 目录。
+- `MONITOR_KNOWLEDGE_SOURCE=shop`：按 `category/sku/store_id` 调用商城只读知识接口。
+- `MONITOR_KNOWLEDGE_SOURCE=mysql`：直连商城只读库（`zhixuanpiao_program_*/order_*/pay_*`），
+  传订单号可同时取到订单状态、支付账单、退款到账记录与节目退改政策；连接必须用 utf8mb4。
+- 两种方式都按 `MONITOR_SHOP_FALLBACK` 回退本地目录（回退会明确标注原因，不会把"取不到依据"当成幻觉）。
+- 完整契约、智选票（zhixuanpiao）表映射与商城侧 Java 骨架见 [SHOP_INTEGRATION.md](SHOP_INTEGRATION.md)。
+
 ## 脱敏与数据边界
 
 - 转发前对手机号、座机、身份证号、银行卡号、邮箱、订单号执行脱敏（`monitor/knowledge.py::redact`）。
@@ -124,7 +153,7 @@ Prometheus 暴露：`monitor_events_total`、`monitor_sampled_total`、`monitor_
 
 ## 已知限制
 
-- 单进程单 worker：不支持多 worker 或分布式消费，数据库是本地 SQLite 文件。
+- 单进程单 worker：不支持多 worker 或分布式消费，数据库是本地 SQLite 文件；多租户是逻辑隔离（同库，按 tenant 过滤）。
 - 批量转发已把吞吐提升到「每批一次上游任务」，但整体仍受上游 2 个并发任务与模型时延约束；更大流量需要提高上游并发或改成消息队列。
 - 规则快检是基于模式与名单的启发式：对非常规表述可能漏报，对通用职务称谓可能误报；命中结论一律进入复核队列。
 - 上游为 mock 模式时，监测结果只验证工程链路，不代表真实模型检出能力。
